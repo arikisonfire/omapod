@@ -3,6 +3,7 @@
 import os
 import sys
 import traceback
+import wave
 from datetime import date
 from pathlib import Path
 
@@ -26,9 +27,17 @@ LONG = "A title far too long for any row, with Donaudampfschifffahrtsgesellschaf
 def add_library(app):
     with app.db.tx() as conn:
         feed = app.db.insert_feed(conn, {"url": "http://x.invalid/feed", "title": LONG, "state": 1})
+    # Two seconds of silence: without a file to play, the player loads nothing and Now Playing does not open.
+    silence = Path(os.environ["OMAPOD_HOME"]) / "silence.wav"
+    with wave.open(str(silence), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(8000)
+        out.writeframes(bytes(2 * 8000 * 2))
     for number in range(3):
-        app.db.execute("INSERT INTO episodes (feed_id, guid, title, duration, pub_date) VALUES (?, ?, ?, ?, ?)",
-                       (feed, f"episode-{number}", LONG, 3_600_000, 1_700_000_000 + number))
+        app.db.execute("INSERT INTO episodes (feed_id, guid, title, duration, pub_date, file_path) "
+                       "VALUES (?, ?, ?, ?, ?, ?)",
+                       (feed, f"episode-{number}", LONG, 3_600_000, 1_700_000_000 + number, str(silence)))
     episode = app.db.get_episodes(limit=1)[0]
     app.db.execute("INSERT INTO listen_log(day, episode_id, feed_id, ms) VALUES(?, ?, ?, ?)",
                    (date.today().isoformat(), episode.id, feed, 3_600_000))
@@ -61,6 +70,30 @@ def pushed_pages(app, feed, episode):
         yield 60
 
 
+def hidden_tab(app):
+    """A long transcript in its tab leaves the scroll range of the show notes alone."""
+    from omapod.feeds.transcripts import Segment
+
+    app.show_now_playing()
+    yield 300
+    page = app.window.nav.get_visible_page()
+    if not hasattr(page, "transcript_page"):
+        print("Now Playing did not open", flush=True)
+        return
+    page.transcript_page.set_visible(True)
+    page._update_switcher()
+    page._transcript_for = page._episode_id
+    yield 300
+    adjustment = page.scrolled.get_vadjustment()
+    before = adjustment.get_upper()
+    page._show_transcript(page._episode_id, [Segment(i * 4000, i * 4000 + 3900, "", LONG) for i in range(300)])
+    yield 300
+    if adjustment.get_upper() > before + 1:
+        print(f"a hidden tab makes Now Playing scroll: {before:.0f} -> {adjustment.get_upper():.0f} px", flush=True)
+    app.window.nav.pop()
+    yield 60
+
+
 def walk(app):
     Gtk.Settings.get_default().set_property("gtk-enable-animations", False)
     yield 1000
@@ -75,6 +108,7 @@ def walk(app):
         yield from resize(window, width, height)
         yield from rail_pages(app)
         yield from pushed_pages(app, feed, episode)
+    yield from hidden_tab(app)
     app.show_page("subscriptions")
     yield 60
     tile = window.root_shown._tiles[feed]

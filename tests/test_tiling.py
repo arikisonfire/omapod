@@ -23,6 +23,8 @@ class TilingTest(unittest.TestCase):
         self.assertEqual(complaints, [])
         self.assertIn("walked", done.stdout, done.stderr)
         self.assertNotIn("wider than its cover", done.stdout)
+        self.assertNotIn("a hidden tab makes", done.stdout)
+        self.assertNotIn("did not open", done.stdout)
 
     def test_english(self):
         self.walk("en")

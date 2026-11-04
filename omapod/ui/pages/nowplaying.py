@@ -130,7 +130,9 @@ class NowPlayingPage(BasePage):
         # Right: show notes, chapters, transcript
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, hexpand=True)
         right.set_size_request(COLUMN, -1)
-        self.tabs = Adw.ViewStack(vexpand=True)
+        # As tall as the open tab: a stack is as tall as its tallest page, so a long transcript or chapter list
+        # would leave screens of empty space to scroll through below short show notes.
+        self.tabs = Adw.ViewStack(vexpand=True, vhomogeneous=False)
         switcher_type = getattr(Adw, "InlineViewSwitcher", None)
         switcher = switcher_type(stack=self.tabs) if switcher_type else Adw.ViewSwitcher(stack=self.tabs)
         switcher.set_halign(Gtk.Align.START)
