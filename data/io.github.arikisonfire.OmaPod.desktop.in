@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=omaPOD
+GenericName=Podcast Player
+Comment=Podcasts for Omarchy, in sync with AntennaPod
+Exec=@BIN@ %U
+Icon=io.github.arikisonfire.OmaPod
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=podcast;rss;antennapod;gpodder;
+StartupNotify=true
+StartupWMClass=io.github.arikisonfire.OmaPod
+MimeType=x-scheme-handler/podcast;x-scheme-handler/itpc;x-scheme-handler/pcast;x-scheme-handler/antennapod-subscribe;text/x-opml;text/x-opml+xml;

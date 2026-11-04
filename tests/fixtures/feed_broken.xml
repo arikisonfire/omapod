@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Broken &nbsp; Feed & Co</title>
+    <itunes:author>Undeclared Prefix</itunes:author>
+    <item>
+      <title>Caf&eacute; episode</title>
+      <guid>b-1</guid>
+      <pubDate>2026-10-10T10:00:00Z</pubDate>
+      <enclosure url="https://example.org/b1.mp3?a=1&b=2" type="audio/mpeg" length="100"/>
+      <itunes:duration>90</itunes:duration>
+    </item>
+  </channel>
+</rss>

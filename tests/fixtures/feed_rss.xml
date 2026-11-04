@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:podcast="https://podcastindex.org/namespace/1.0" xmlns:psc="http://podlove.org/simple-chapters" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Test Cast</title>
+    <link>https://example.org/testcast</link>
+    <description>A podcast for testing &amp; stuff.</description>
+    <language>en</language>
+    <itunes:author>Jane Doe</itunes:author>
+    <itunes:image href="https://example.org/cover.jpg"/>
+    <itunes:type>episodic</itunes:type>
+    <podcast:funding url="https://example.org/donate">Support us</podcast:funding>
+    <podcast:guid>c2f2f2f2-0000-4000-8000-000000000001</podcast:guid>
+    <atom:link rel="next" href="https://example.org/feed?page=2"/>
+    <item>
+      <title>Episode 3: Chapters</title>
+      <guid isPermaLink="false">ep-3</guid>
+      <pubDate>Wed, 15 Oct 2026 08:00:00 +0200</pubDate>
+      <enclosure url="https://example.org/ep3.mp3" length="12345678" type="audio/mpeg"/>
+      <itunes:duration>1:02:03</itunes:duration>
+      <description>Short</description>
+      <content:encoded><![CDATA[<p>Long <b>show notes</b> with a timestamp 12:34 and <a href="https://example.org">link</a>.</p>]]></content:encoded>
+      <itunes:image href="https://example.org/ep3.jpg"/>
+      <itunes:season>2</itunes:season>
+      <itunes:episode>3</itunes:episode>
+      <podcast:chapters url="https://example.org/ep3.json" type="application/json+chapters"/>
+      <podcast:transcript url="https://example.org/ep3.srt" type="application/x-subrip"/>
+      <podcast:transcript url="https://example.org/ep3.json.txt" type="application/json"/>
+      <psc:chapters version="1.2">
+        <psc:chapter start="00:00:00.000" title="Intro"/>
+        <psc:chapter start="00:05:00" title="Topic" href="https://example.org/topic"/>
+      </psc:chapters>
+    </item>
+    <item>
+      <title>Episode 2 &amp; friends</title>
+      <guid>ep-2</guid>
+      <pubDate>Wed, 08 Oct 2026 08:00:00 GMT</pubDate>
+      <enclosure url="https://example.org/ep2.m4a" length="5000" type="audio/x-m4a"/>
+      <itunes:duration>2723</itunes:duration>
+    </item>
+    <item>
+      <title>Episode 1</title>
+      <pubDate>Wed, 1 Oct 2026 08:00:00 EST</pubDate>
+      <enclosure url="https://example.org/ep1.mp3" type=""/>
+      <itunes:duration>45:10</itunes:duration>
+    </item>
+    <item>
+      <title>Text only post</title>
+      <guid>post-1</guid>
+      <pubDate>Thu, 02 Oct 2026 10:00:00 +0000</pubDate>
+      <description>No media here</description>
+    </item>
+  </channel>
+</rss>

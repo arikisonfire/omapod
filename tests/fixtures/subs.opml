@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<opml version="1.0"><head><title>x</title></head><body>
+<outline text="Group"><outline text="Test Cast" type="rss" xmlUrl="https://example.org/feed" htmlUrl="https://example.org"/></outline>
+<outline title="Atom" xmlUrl="feed://atom.example/feed.xml"/>
+<outline text="no url"/>
+</body></opml>

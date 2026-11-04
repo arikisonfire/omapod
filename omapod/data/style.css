@@ -1,0 +1,925 @@
+/* omaPOD stylesheet template. @{name} placeholders are filled from the
+   active Omarchy theme by ui/theme.py; nothing here is a fixed colour. */
+
+:root {
+  --accent-bg-color: @{accent};
+  --accent-fg-color: @{accent_on};
+  --accent-color: @{accent_text};
+  --destructive-bg-color: @{red};
+  --destructive-fg-color: @{bg};
+  --destructive-color: @{red_text};
+  --error-bg-color: @{red};
+  --error-fg-color: @{bg};
+  --error-color: @{red_text};
+  --success-bg-color: @{green};
+  --success-fg-color: @{bg};
+  --success-color: @{fg};
+  --warning-bg-color: @{yellow};
+  --warning-fg-color: @{bg};
+  --warning-color: @{fg};
+  --window-bg-color: @{bg};
+  --window-fg-color: @{fg};
+  --view-bg-color: @{bg};
+  --view-fg-color: @{fg};
+  --headerbar-bg-color: @{bg};
+  --headerbar-fg-color: @{fg};
+  --headerbar-border-color: @{hairline};
+  --headerbar-backdrop-color: @{bg};
+  --headerbar-shade-color: transparent;
+  --headerbar-darker-shade-color: transparent;
+  --sidebar-bg-color: @{bg_dark};
+  --sidebar-fg-color: @{fg};
+  --sidebar-backdrop-color: @{bg_dark};
+  --sidebar-border-color: @{hairline};
+  --sidebar-shade-color: transparent;
+  --secondary-sidebar-bg-color: @{bg_dark};
+  --secondary-sidebar-fg-color: @{fg};
+  --secondary-sidebar-backdrop-color: @{bg_dark};
+  --secondary-sidebar-border-color: @{hairline};
+  --secondary-sidebar-shade-color: transparent;
+  --card-bg-color: @{fill};
+  --card-fg-color: @{fg};
+  --card-shade-color: transparent;
+  --dialog-bg-color: @{bg};
+  --dialog-fg-color: @{fg};
+  --popover-bg-color: @{bg};
+  --popover-fg-color: @{fg};
+  --popover-shade-color: transparent;
+  --thumbnail-bg-color: @{bg_light};
+  --thumbnail-fg-color: @{fg};
+  --shade-color: @{shade};
+  --scrollbar-outline-color: transparent;
+  --border-color: @{hairline_strong};
+  --window-radius: @{radius};
+  --overview-bg-color: @{bg_dark};
+  --overview-fg-color: @{fg};
+  --active-toggle-bg-color: @{fill_selected};
+  --active-toggle-fg-color: @{fg};
+}
+
+@define-color accent_bg_color @{accent};
+@define-color accent_fg_color @{accent_on};
+@define-color accent_color @{accent_text};
+@define-color window_bg_color @{bg};
+@define-color window_fg_color @{fg};
+@define-color view_bg_color @{bg};
+@define-color view_fg_color @{fg};
+@define-color headerbar_bg_color @{bg};
+@define-color headerbar_fg_color @{fg};
+@define-color sidebar_bg_color @{bg_dark};
+@define-color popover_bg_color @{bg};
+@define-color popover_fg_color @{fg};
+@define-color dialog_bg_color @{bg};
+@define-color card_bg_color @{fill};
+@define-color destructive_bg_color @{red};
+@define-color destructive_color @{red_text};
+@define-color error_color @{red_text};
+@define-color success_color @{fg};
+@define-color warning_color @{fg};
+
+/* ------------------------------------------------------------ base */
+
+window,
+dialog,
+popover,
+tooltip,
+.omp-root {
+  font-family: @{font};
+  font-size: @{fs_body};
+  /* A programmer's font joins characters like -> and !=. Podcast titles do not want that, and without it
+     JetBrains Mono lays out text twice as fast, which every list on every page feels. */
+  font-feature-settings: "calt" 0;
+}
+
+window.background,
+.omp-root {
+  background-color: @{bg};
+  color: @{fg};
+}
+
+selection,
+text selection,
+label selection {
+  background-color: @{selection};
+  color: @{fg};
+}
+
+text,
+entry,
+textview {
+  caret-color: @{accent};
+}
+
+*:focus-visible {
+  outline: 1px solid @{accent};
+  outline-offset: -1px;
+}
+
+scrollbar slider {
+  background-color: @{border};
+  border-radius: 0;
+  min-width: 4px;
+  min-height: 4px;
+}
+
+scrollbar slider:hover,
+scrollbar slider:active {
+  background-color: @{fg2};
+}
+
+separator {
+  background-color: @{hairline};
+  min-width: 1px;
+  min-height: 1px;
+}
+
+.dim-label,
+.omp-dim {
+  color: @{fg2};
+  opacity: 1;
+}
+
+/* Typography on the shell's scale */
+.title-1,
+.omp-display-large {
+  font-size: @{fs_display_large};
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.title-2,
+.omp-display {
+  font-size: @{fs_display};
+  font-weight: 700;
+  letter-spacing: -0.015em;
+}
+
+.title-3,
+.omp-heading {
+  font-size: @{fs_heading};
+  font-weight: 700;
+}
+
+.title-4,
+.heading,
+.omp-title {
+  font-size: @{fs_title};
+  font-weight: 700;
+}
+
+.caption,
+.omp-caption {
+  font-size: @{fs_caption};
+}
+
+.omp-small {
+  font-size: @{fs_small};
+}
+
+.numeric,
+.omp-numeric {
+  font-feature-settings: "calt" 0, "tnum";
+}
+
+/* ------------------------------------------------------------ controls (shell tokens) */
+
+button {
+  border-radius: @{radius_small};
+  background-color: @{fill};
+  color: @{fg};
+  box-shadow: inset 0 0 0 1px @{border};
+  min-height: @{control_h};
+  padding: 0 @{sp_xl};
+  transition: background-color 150ms ease-out, box-shadow 150ms ease-out;
+}
+
+button:hover {
+  background-color: @{fill_hover};
+  box-shadow: inset 0 0 0 1px @{border_hover};
+}
+
+button:active,
+button:checked {
+  background-color: @{fill_pressed};
+}
+
+button:checked {
+  background-color: @{fill_selected};
+  box-shadow: none;
+}
+
+button:disabled {
+  opacity: 0.45;
+}
+
+button.flat,
+button.omp-flat,
+menubutton.flat > button,
+splitbutton.flat > button,
+headerbar button,
+.toolbar button,
+.omp-dock button,
+.omp-rail button {
+  background-color: transparent;
+  box-shadow: none;
+}
+
+button.flat:hover,
+button.omp-flat:hover,
+menubutton.flat > button:hover,
+headerbar button:hover,
+.toolbar button:hover,
+.omp-dock button:hover,
+.omp-rail button:hover {
+  background-color: @{fill_hover};
+}
+
+button.flat:active,
+button.omp-flat:active,
+headerbar button:active,
+.omp-dock button:active {
+  background-color: @{fill_pressed};
+}
+
+button.flat:checked,
+headerbar button:checked,
+.omp-dock button:checked {
+  background-color: @{fill_selected};
+}
+
+button.suggested-action,
+button.omp-primary {
+  background-color: @{accent};
+  color: @{accent_on};
+  box-shadow: none;
+  font-weight: 700;
+}
+
+button.suggested-action:hover,
+button.omp-primary:hover {
+  background-color: mix(@{accent}, @{fg}, 0.12);
+}
+
+button.suggested-action:active,
+button.omp-primary:active {
+  background-color: mix(@{accent}, @{bg}, 0.18);
+}
+
+button.destructive-action {
+  background-color: transparent;
+  color: @{red_text};
+  box-shadow: inset 0 0 0 1px @{red};
+}
+
+button.destructive-action:hover {
+  background-color: alpha(@{red}, 0.12);
+}
+
+button.pill,
+button.circular {
+  border-radius: @{radius};
+}
+
+button.circular {
+  padding: 0;
+  min-width: @{control_h};
+}
+
+button.image-button {
+  padding: 0 @{sp_md};
+}
+
+button.omp-icon {
+  min-width: @{control_h};
+  padding: 0;
+}
+
+menubutton > button,
+splitbutton > button {
+  border-radius: @{radius_small};
+}
+
+entry,
+spinbutton,
+dropdown > button,
+combobox > box > button,
+.omp-field {
+  border-radius: @{radius_small};
+  background-color: @{fill};
+  box-shadow: inset 0 0 0 1px @{border};
+  min-height: @{control_h};
+}
+
+entry:focus-within,
+spinbutton:focus-within {
+  box-shadow: inset 0 0 0 1px @{accent};
+  outline: none;
+}
+
+entry > text > placeholder,
+entry text placeholder {
+  color: @{fg3};
+}
+
+switch {
+  border-radius: @{radius};
+  background-color: @{fill_selected};
+  box-shadow: inset 0 0 0 1px @{border};
+}
+
+switch > slider {
+  border-radius: @{radius};
+  background-color: @{fg};
+  box-shadow: none;
+}
+
+switch:checked {
+  background-color: @{accent};
+  box-shadow: none;
+}
+
+switch:checked > slider {
+  background-color: @{accent_on};
+}
+
+checkbutton check,
+checkbutton radio,
+row check {
+  background-color: @{fill};
+  box-shadow: inset 0 0 0 1px @{border};
+  border-radius: @{radius_small};
+}
+
+checkbutton radio {
+  border-radius: 999px;
+}
+
+checkbutton check:checked,
+checkbutton radio:checked,
+row check:checked {
+  background-color: @{accent};
+  color: @{accent_on};
+  box-shadow: none;
+}
+
+scale trough,
+progressbar trough {
+  background-color: @{fill_selected};
+  border-radius: 0;
+  min-height: 3px;
+}
+
+scale highlight,
+progressbar progress {
+  background-color: @{accent};
+  border-radius: 0;
+}
+
+scale slider {
+  background-color: @{accent};
+  border-radius: @{radius_small};
+  min-width: 14px;
+  min-height: 14px;
+  margin: -6px;
+  box-shadow: none;
+  border: none;
+}
+
+progressbar.osd trough {
+  background-color: transparent;
+}
+
+/* Popovers and dialogs get the shell's accent frame */
+popover > contents,
+popover.menu > contents {
+  background-color: @{bg};
+  color: @{fg};
+  border-radius: @{radius};
+  box-shadow: 0 0 0 1px @{accent}, 0 6px 18px @{shade};
+  padding: @{sp_md};
+}
+
+popover > arrow {
+  background-color: @{accent};
+}
+
+popover.menu modelbutton,
+popover.menu menuitem {
+  border-radius: 0;
+  min-height: @{control_h};
+  padding: 0 @{sp_xl};
+}
+
+popover.menu modelbutton:hover,
+popover.menu modelbutton:selected {
+  background-color: @{fill_hover};
+  color: @{accent_text};
+}
+
+tooltip,
+tooltip.background {
+  background-color: @{bg};
+  color: @{fg};
+  border-radius: @{radius};
+  box-shadow: 0 0 0 1px @{border};
+  padding: @{sp_sm} @{sp_lg};
+}
+
+dialog.floating sheet,
+dialog.floating .dialog-contents,
+window.dialog,
+.omp-dialog {
+  border-radius: @{radius};
+  box-shadow: 0 0 0 1px @{accent}, 0 12px 32px @{shade};
+}
+
+toast {
+  border-radius: @{radius};
+  background-color: @{bg_darker};
+  color: @{fg};
+  box-shadow: 0 0 0 1px @{accent}, 0 6px 18px @{shade};
+}
+
+banner > revealer > widget {
+  background-color: @{accent_soft};
+}
+
+headerbar,
+.top-bar {
+  background-color: @{bg};
+  box-shadow: none;
+  min-height: 44px;
+}
+
+/* Boxed lists (settings) */
+list.boxed-list,
+.boxed-list,
+preferencesgroup > box > list {
+  border-radius: @{radius};
+  background-color: transparent;
+  box-shadow: inset 0 0 0 1px @{hairline_strong};
+}
+
+list.boxed-list > row,
+.boxed-list > row {
+  border-radius: 0;
+}
+
+row.activatable:hover {
+  background-color: @{fill_hover};
+}
+
+row:selected {
+  background-color: @{selection};
+}
+
+listview,
+gridview,
+list {
+  background-color: transparent;
+}
+
+listview > row:selected,
+gridview > child:selected {
+  background-color: @{selection};
+}
+
+listview > row,
+gridview > child {
+  border-radius: 0;
+}
+
+/* ------------------------------------------------------------ navigation rail */
+
+.omp-rail {
+  background-color: @{bg_dark};
+  border-right: 1px solid @{hairline};
+}
+
+.omp-wordmark {
+  font-size: @{fs_heading};
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  padding: @{sp_xxl} @{sp_xxl} @{sp_md} @{sp_xxl};
+}
+
+.omp-wordmark .omp-wordmark-accent,
+label.omp-wordmark-accent {
+  color: @{accent_text};
+}
+
+.omp-rail listview,
+.omp-rail list {
+  background-color: transparent;
+  padding: 0 @{sp_md};
+}
+
+.omp-nav-row {
+  min-height: @{control_h};
+  padding: @{sp_sm} @{sp_lg};
+  border-radius: @{radius_small};
+}
+
+.omp-rail row {
+  border-radius: @{radius_small};
+  margin: 1px 0;
+}
+
+.omp-rail row:hover {
+  background-color: @{fill_hover};
+}
+
+.omp-rail row:selected {
+  background-color: @{fill_selected};
+  color: @{fg};
+}
+
+.omp-rail row:selected .omp-nav-label {
+  font-weight: 700;
+}
+
+.omp-rail row:selected .omp-nav-icon {
+  color: @{accent_text};
+}
+
+.omp-nav-icon {
+  color: @{fg2};
+}
+
+.omp-section-label {
+  color: @{fg2};
+  font-size: @{fs_caption};
+  font-weight: 700;
+  padding: @{sp_huge} @{sp_xxl} @{sp_sm} @{sp_xxl};
+}
+
+.omp-count {
+  color: @{fg2};
+  font-size: @{fs_small};
+  font-feature-settings: "calt" 0, "tnum";
+}
+
+.omp-count.omp-count-new {
+  color: @{accent_text};
+  font-weight: 700;
+}
+
+/* ------------------------------------------------------------ pages */
+
+.omp-page-header {
+  padding: @{sp_page} @{sp_page} @{sp_lg} @{sp_page};
+}
+
+.omp-page-sub {
+  color: @{fg2};
+  font-size: @{fs_small};
+}
+
+.omp-toolbar {
+  padding: 0 @{sp_page} @{sp_lg} @{sp_page};
+}
+
+.omp-chip {
+  border-radius: @{radius_small};
+  background-color: transparent;
+  box-shadow: inset 0 0 0 1px @{border};
+  min-height: 24px;
+  padding: 0 @{sp_lg};
+  font-size: @{fs_small};
+}
+
+.omp-chip:checked {
+  background-color: @{fill_selected};
+  box-shadow: inset 0 0 0 1px @{fg2};
+  color: @{fg};
+}
+
+.omp-empty {
+  padding: 48px @{sp_page};
+}
+
+.omp-empty .omp-empty-title {
+  font-size: @{fs_heading};
+  font-weight: 700;
+}
+
+.omp-empty .omp-empty-text {
+  color: @{fg2};
+}
+
+.omp-empty-icon {
+  color: @{fg3};
+}
+
+.omp-section-title {
+  font-size: @{fs_heading};
+  font-weight: 700;
+  padding: @{sp_huge} @{sp_page} @{sp_md} @{sp_page};
+}
+
+/* ------------------------------------------------------------ covers */
+
+.omp-cover {
+  background-color: @{bg_light};
+  border-radius: @{radius_small};
+}
+
+.omp-cover-fallback {
+  color: @{fg2};
+  font-weight: 800;
+}
+
+/* The playing episode is framed like the focused Hyprland window. */
+.omp-cover.omp-playing,
+.omp-frame-active {
+  box-shadow: 0 0 0 2px @{accent};
+}
+
+/* ------------------------------------------------------------ episode rows */
+
+.omp-row {
+  padding: @{sp_lg} @{sp_page} @{sp_lg} @{sp_page};
+  border-bottom: 1px solid @{hairline};
+}
+
+listview > row:hover .omp-row,
+.omp-row:hover {
+  background-color: @{fill};
+}
+
+.omp-row .omp-row-title {
+  font-size: @{fs_subtitle};
+  font-weight: 700;
+}
+
+.omp-row.omp-played .omp-row-title,
+.omp-row.omp-played .omp-row-meta {
+  color: @{fg3};
+}
+
+.omp-row .omp-row-meta {
+  color: @{fg2};
+  font-size: @{fs_small};
+  font-feature-settings: "calt" 0, "tnum";
+}
+
+.omp-row .omp-row-podcast {
+  color: @{fg2};
+  font-size: @{fs_small};
+}
+
+.omp-new-mark {
+  background-color: @{accent};
+  min-width: 7px;
+  min-height: 7px;
+  border-radius: 999px;
+}
+
+.omp-state-icon {
+  color: @{fg2};
+}
+
+.omp-state-icon.omp-favorite {
+  color: @{accent_text};
+}
+
+.omp-row-progress trough {
+  min-height: 2px;
+  background-color: @{fill_selected};
+}
+
+.omp-row-progress progress {
+  min-height: 2px;
+  background-color: @{accent};
+}
+
+.omp-row.omp-now .omp-row-title {
+  color: @{accent_text};
+}
+
+button.omp-action {
+  min-width: 34px;
+  min-height: 34px;
+  padding: 0;
+  border-radius: @{radius_small};
+}
+
+button.omp-action.omp-action-play {
+  background-color: @{accent};
+  color: @{accent_on};
+  box-shadow: none;
+}
+
+button.omp-action.omp-action-play:hover {
+  background-color: mix(@{accent}, @{fg}, 0.12);
+}
+
+.omp-download-label {
+  font-size: @{fs_caption};
+  font-feature-settings: "calt" 0, "tnum";
+  color: @{accent_text};
+}
+
+/* ------------------------------------------------------------ subscriptions grid */
+
+.omp-tile {
+  padding: @{sp_md};
+  border-radius: @{radius_small};
+}
+
+gridview > child:hover .omp-tile,
+flowboxchild:hover .omp-tile {
+  background-color: @{fill_hover};
+}
+
+.omp-tile-title {
+  font-size: @{fs_small};
+  font-weight: 700;
+}
+
+.omp-badge {
+  background-color: @{accent};
+  color: @{accent_on};
+  font-size: @{fs_caption};
+  font-weight: 800;
+  padding: 0 @{sp_sm};
+  min-height: 16px;
+  min-width: 16px;
+  border-radius: @{radius_small};
+}
+
+/* ------------------------------------------------------------ player dock */
+
+.omp-dock {
+  background-color: @{bg_darker};
+  border-top: 1px solid @{hairline_strong};
+  padding: @{sp_lg} @{sp_xxl};
+}
+
+.omp-dock .omp-dock-title {
+  font-size: @{fs_subtitle};
+  font-weight: 700;
+}
+
+.omp-dock .omp-dock-sub {
+  color: @{fg2};
+  font-size: @{fs_small};
+}
+
+.omp-dock .omp-dock-chapter {
+  color: @{accent_text};
+  font-size: @{fs_small};
+}
+
+button.omp-play {
+  background-color: @{accent};
+  color: @{accent_on};
+  min-width: 40px;
+  min-height: 40px;
+  padding: 0;
+  border-radius: @{radius_small};
+  box-shadow: none;
+}
+
+.omp-dock button.omp-play:hover,
+button.omp-play:hover {
+  background-color: mix(@{accent}, @{fg}, 0.12);
+}
+
+.omp-time {
+  color: @{fg2};
+  font-size: @{fs_small};
+  font-feature-settings: "calt" 0, "tnum";
+}
+
+button.omp-speed {
+  font-weight: 700;
+  font-feature-settings: "calt" 0, "tnum";
+  padding: 0 @{sp_md};
+}
+
+.omp-sleep-active {
+  color: @{accent_text};
+}
+
+/* ------------------------------------------------------------ now playing */
+
+.omp-np {
+  padding: @{sp_page};
+}
+
+.omp-np-title {
+  font-size: @{fs_display};
+  font-weight: 800;
+  letter-spacing: -0.015em;
+}
+
+.omp-np-podcast {
+  color: @{fg2};
+  font-size: @{fs_subtitle};
+}
+
+.omp-np-chapter {
+  color: @{accent_text};
+  font-size: @{fs_subtitle};
+  font-weight: 700;
+}
+
+/* Chapters as workspaces */
+button.omp-ws {
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0 @{sp_sm};
+  border-radius: @{radius_small};
+  background-color: transparent;
+  box-shadow: inset 0 0 0 1px @{border};
+  font-size: @{fs_small};
+  font-weight: 700;
+  font-feature-settings: "calt" 0, "tnum";
+}
+
+button.omp-ws.omp-ws-done {
+  color: @{fg2};
+}
+
+button.omp-ws.omp-ws-current {
+  background-color: @{accent};
+  color: @{accent_on};
+  box-shadow: none;
+}
+
+.omp-chapter-row {
+  padding: @{sp_md} @{sp_lg};
+  border-bottom: 1px solid @{hairline};
+}
+
+.omp-chapter-row.omp-current .omp-chapter-title {
+  color: @{accent_text};
+  font-weight: 700;
+}
+
+.omp-notes {
+  font-size: @{fs_subtitle};
+}
+
+.omp-notes link,
+label link {
+  color: @{accent_text};
+}
+
+.omp-transcript-speaker {
+  color: @{fg2};
+  font-size: @{fs_small};
+  font-weight: 700;
+}
+
+.omp-transcript-text.omp-current {
+  color: @{accent_text};
+}
+
+/* ------------------------------------------------------------ feed header */
+
+.omp-feed-header {
+  padding: @{sp_page};
+}
+
+.omp-feed-title {
+  font-size: @{fs_display};
+  font-weight: 800;
+}
+
+.omp-feed-author {
+  color: @{fg2};
+}
+
+.omp-error-box {
+  box-shadow: inset 0 0 0 1px @{red};
+  padding: @{sp_lg} @{sp_xl};
+  color: @{red_text};
+}
+
+/* ------------------------------------------------------------ statistics */
+
+.omp-stat-bar trough {
+  min-height: 6px;
+  background-color: @{fill};
+}
+
+.omp-stat-bar progress {
+  min-height: 6px;
+  background-color: @{accent};
+}
+
+.omp-stat-total {
+  font-size: @{fs_hero};
+  font-weight: 800;
+  font-feature-settings: "calt" 0, "tnum";
+}
+
+/* ------------------------------------------------------------ selection mode bar */
+
+.omp-actionbar {
+  background-color: @{bg_darker};
+  border-top: 1px solid @{accent};
+  padding: @{sp_md} @{sp_xxl};
+}

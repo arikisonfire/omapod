@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <title>Atom Cast</title>
+  <subtitle>An Atom podcast</subtitle>
+  <link rel="alternate" href="https://atom.example/"/>
+  <logo>https://atom.example/logo.png</logo>
+  <author><name>Atom Author</name></author>
+  <entry>
+    <id>urn:atom:1</id>
+    <title>First atom</title>
+    <link rel="enclosure" href="https://atom.example/1.ogg" type="audio/ogg" length="999999"/>
+    <link rel="alternate" href="https://atom.example/1"/>
+    <published>2026-09-01T12:00:00+02:00</published>
+    <summary type="html">&lt;p&gt;Hello&lt;/p&gt;</summary>
+    <itunes:duration>00:30:00</itunes:duration>
+  </entry>
+</feed>

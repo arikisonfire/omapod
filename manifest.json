@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.arikisonfire.pod",
+  "name": "omaPOD",
+  "version": "0.1.0",
+  "author": "arikisonfire",
+  "license": "GPL-3.0-or-later",
+  "description": "A podcast app for Omarchy, modelled on AntennaPod: a window that tiles and follows your theme, with inbox, queue, downloads, chapters, statistics and backups, plus a bar widget for playback, speed and sleep timer. Picks up where AntennaPod on your phone stopped, through Nextcloud or gpodder.net.",
+  "homepage": "https://github.com/arikisonfire/omapod",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "plugin/BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "omaPOD",
+    "description": "Podcast now playing with controls, chapters, speed and sleep timer",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showTitle": true,
+      "maxTitleWidth": 180,
+      "hideWhenStopped": false,
+      "launchCommand": "",
+      "socketPath": ""
+    },
+    "schema": [
+      {
+        "key": "showTitle",
+        "type": "boolean",
+        "label": "Show the episode title in the bar"
+      },
+      {
+        "key": "maxTitleWidth",
+        "type": "integer",
+        "label": "Maximum title width (px)"
+      },
+      {
+        "key": "hideWhenStopped",
+        "type": "boolean",
+        "label": "Hide the widget when nothing is loaded"
+      },
+      {
+        "key": "launchCommand",
+        "type": "string",
+        "label": "Command that starts omaPOD (empty: the one that came with the widget, or the installed one)"
+      },
+      {
+        "key": "socketPath",
+        "type": "string",
+        "label": "Control socket (leave empty for the default)"
+      }
+    ]
+  }
+}
