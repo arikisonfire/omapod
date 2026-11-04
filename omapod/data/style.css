@@ -212,13 +212,14 @@ button:disabled {
   opacity: 0.45;
 }
 
+/* The dock's buttons are flat by their own classes: a rule for every button in the dock would also reach the buttons
+   in its popovers (speed presets, sleep timer), which then lose their outline. */
 button.flat,
 button.omp-flat,
 menubutton.flat > button,
 splitbutton.flat > button,
 headerbar button,
 .toolbar button,
-.omp-dock button,
 .omp-rail button {
   background-color: transparent;
   box-shadow: none;
@@ -229,21 +230,18 @@ button.omp-flat:hover,
 menubutton.flat > button:hover,
 headerbar button:hover,
 .toolbar button:hover,
-.omp-dock button:hover,
 .omp-rail button:hover {
   background-color: @{fill_hover};
 }
 
 button.flat:active,
 button.omp-flat:active,
-headerbar button:active,
-.omp-dock button:active {
+headerbar button:active {
   background-color: @{fill_pressed};
 }
 
 button.flat:checked,
-headerbar button:checked,
-.omp-dock button:checked {
+headerbar button:checked {
   background-color: @{fill_selected};
 }
 
@@ -781,7 +779,6 @@ button.omp-play {
   box-shadow: none;
 }
 
-.omp-dock button.omp-play:hover,
 button.omp-play:hover {
   background-color: mix(@{accent}, @{fg}, 0.12);
 }
