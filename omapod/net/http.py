@@ -1,9 +1,10 @@
 """HTTP client on top of urllib.
 
 Handles conditional GETs (ETag / Last-Modified), gzip, basic auth for
-password-protected feeds, permanent-redirect tracking (feeds that moved),
-the optional proxy from the settings and human-readable error reasons
-(the same categories AntennaPod shows in its download log).
+password-protected feeds (sent to their own server only), permanent-redirect
+tracking (feeds that moved), the optional proxy from the settings and
+human-readable error reasons (the same categories AntennaPod shows in its
+download log).
 """
 
 import base64
@@ -26,11 +27,12 @@ PROXY_AUTH = "Proxy-authorization"  # as urllib's ProxyHandler names the header 
 
 
 class HttpError(Exception):
-    def __init__(self, message, status=0, detail="", url=""):
+    def __init__(self, message, status=0, detail="", url="", final_url=""):
         super().__init__(message)
         self.status = status
         self.detail = detail or message
         self.url = url
+        self.final_url = final_url or url  # the address that gave the answer, at the end of any redirects
 
 
 class CertificateError(HttpError):
@@ -92,11 +94,20 @@ def _origin(url):
 def auth_allowed(owner, target):
     """May credentials entered for the address `owner` (a feed, a sync server) go along to `target`?
     Only to the same origin, or to its https upgrade on the default ports, as curl and requests decide:
-    never to another host, never back to plain http."""
+    never to another host, not even one that asks for them (401), and never back to plain http."""
     owner, target = _origin(owner), _origin(target)
     if not owner[1] or owner[1] != target[1]:
         return False
     return owner == target or (owner[0], owner[2], target[0], target[2]) == ("http", 80, "https", 443)
+
+
+def withheld(owner, asked):
+    """Why the 401 answer of `asked` cannot be helped: credentials for `owner` never go there (auth_allowed).
+    "" when they may go there, so they were sent along and are wrong, or missing."""
+    if auth_allowed(owner, asked):
+        return ""
+    return _("{host} asks for a password, but omaPOD sends this podcast's password only to {own}.").format(
+        host=urlsplit(asked).hostname or asked, own=urlsplit(owner).hostname or owner)
 
 
 class _RedirectRecorder(urllib.request.HTTPRedirectHandler):
@@ -363,49 +374,20 @@ def _prepare(url, method, headers, data, auth, auth_url):
     return req
 
 
-def _retry_with_auth(req, error):
-    """A host that is not the one the credentials belong to asks for them (401), for example a CDN with the
-    podcast's own login: AntennaPod answers with them, omaPOD too but only over https."""
-    target = error.geturl()
-    if (error.code != 401 or not req.authorization or req.get_method() not in ("GET", "HEAD")
-            or auth_allowed(req.auth_url, target) or urlsplit(target).scheme != "https"):
-        return None  # sent along already (so they are wrong), or not for this host
-    retry = urllib.request.Request(target, method=req.get_method())
-    for key, value in req.headers.items():
-        if key != PROXY_AUTH:  # see _RedirectRecorder
-            retry.add_header(key, value)
-    retry.authorization, retry.auth_url = req.authorization, target
-    retry.redirect_chain = req.redirect_chain
-    retry.add_unredirected_header("Authorization", req.authorization)
-    return retry
-
-
-def _open(req, timeout, cert_sha256="", auth_on_challenge=False):
-    try:
-        return build_opener(cert_sha256).open(req, timeout=timeout)
-    except urllib.error.HTTPError as error:
-        retry = _retry_with_auth(req, error) if auth_on_challenge else None
-        if retry is None:
-            raise
-        error.close()
-    return build_opener(cert_sha256).open(retry, timeout=timeout)
-
-
-def open_url(url, method="GET", headers=None, data=None, auth=None, timeout=TIMEOUT, auth_url="",
-             auth_on_challenge=False):
+def open_url(url, method="GET", headers=None, data=None, auth=None, timeout=TIMEOUT, auth_url=""):
     """Open a streaming response. The caller must close it. Returns (response, redirect_chain).
-    Credentials work as in request()."""
+    Credentials work as in request(); an HTTPError's geturl() is the address that answered."""
     req = _prepare(url, method, {"Accept-Encoding": "identity", **(headers or {})}, data, auth, auth_url)
-    response = _open(req, timeout, auth_on_challenge=auth_on_challenge)
+    response = build_opener().open(req, timeout=timeout)
     return response, req.redirect_chain
 
 
 def request(url, method="GET", headers=None, data=None, auth=None, timeout=TIMEOUT, etag="", last_modified="",
-            max_bytes=64 * 1024 * 1024, cert_sha256="", auth_url="", auth_on_challenge=False):
+            max_bytes=64 * 1024 * 1024, cert_sha256="", auth_url=""):
     """Fetch a whole resource into memory. Raises NotModified for 304, HttpError otherwise.
     With cert_sha256, HTTPS accepts only that certificate (one the user trusted explicitly).
-    Credentials go only to the origin of auth_url (by default url), also along redirects; with
-    auth_on_challenge also to another https host in between that asks for them."""
+    Credentials go only to the origin of auth_url (by default url), also along redirects, and never to
+    another host, even one that asks for them; HttpError.final_url names the address that answered."""
     defaults = {"Accept-Encoding": "gzip, deflate"}
     if etag:
         defaults["If-None-Match"] = etag
@@ -414,7 +396,7 @@ def request(url, method="GET", headers=None, data=None, auth=None, timeout=TIMEO
     req = _prepare(url, method, {**defaults, **(headers or {})}, data, auth, auth_url)
     url = req.full_url
     try:
-        with _open(req, timeout, cert_sha256, auth_on_challenge) as handle:
+        with build_opener(cert_sha256).open(req, timeout=timeout) as handle:
             body = handle.read(max_bytes + 1)
             if len(body) > max_bytes:
                 raise HttpError(_("The response is too large."), url=url)
@@ -425,10 +407,11 @@ def request(url, method="GET", headers=None, data=None, auth=None, timeout=TIMEO
             final_url = handle.geturl()
             status = handle.status
     except urllib.error.HTTPError as error:
+        error.close()  # its connection; status, reason and address stay readable
         if error.code == 304:
             raise NotModified() from None
         reason, detail = describe_error(error, url)
-        raise HttpError(reason, status=error.code, detail=detail, url=url) from None
+        raise HttpError(reason, status=error.code, detail=detail, url=url, final_url=error.geturl()) from None
     except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
         reason, detail = describe_error(error, url)
         inner = error.reason if isinstance(error, urllib.error.URLError) else error

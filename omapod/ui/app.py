@@ -760,7 +760,11 @@ class OmaPodApp(Adw.Application):
             if isinstance(error, AuthRequired):
                 from .dialogs import ask_credentials
 
-                ask_credentials(self.window, url, lambda u, p: self.preview_url(url, u, p, on_done))
+                # The address that asked, which a redirect may have led to: the dialog names its host, and the
+                # password entered there goes only to that host (the podcast is subscribed at that address).
+                asked = error.url or url
+                ask_credentials(self.window, urlsplit(asked).hostname or asked,
+                                lambda u, p: self.preview_url(asked, u, p, on_done))
             elif isinstance(error, NotAFeedError) and error.candidates:
                 from .dialogs import choose_feed
 

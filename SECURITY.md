@@ -48,9 +48,11 @@ system's proxy settings instead.
 ## How credentials are protected
 
 - **Protected podcasts:** the username and password go only to the feed's own server (same scheme, host and
-  port, or its https upgrade). Another server receives them only over https and only when it asks for them
-  (HTTP 401), as with media hosts that share the podcast's login. Redirects never carry them elsewhere, and a
-  protected podcast never moves to another host on its own.
+  port, or its https upgrade): for the feed, its older pages, downloads and streams. No other server receives
+  them, not even one that asks for them (HTTP 401); a download from such a server fails with a message that
+  names it. Redirects never carry them elsewhere, and a protected podcast never moves to another host on its own.
+  If the address you subscribe to redirects to another server that asks for a password, the login dialog names
+  that server; the podcast is then subscribed at its address, and the password goes to that server only.
 - **Sync:** TLS certificates are checked. A certificate your system does not trust (self-signed, your own
   certificate authority) is accepted only after you have seen its SHA-256 fingerprint and confirmed it, and
   from then on only exactly that certificate. For an address typed without `http://` or `https://`, omaPOD uses

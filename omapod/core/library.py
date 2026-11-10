@@ -187,17 +187,17 @@ class Library:
     # ------------------------------------------------------------ fetching
 
     def fetch(self, url, username="", password="", etag="", last_modified="", auth_url=""):
-        """auth_url: the podcast's own address when fetching another one for it (its next pages); the
-        password goes to other hosts only when they ask for it over https."""
+        """auth_url: the podcast's own address when fetching another one for it (its next pages). The password
+        goes only to that address's server, never to another host, even one that asks for it. A 401 raises
+        AuthRequired with the address that asked, which a redirect may have led to."""
         auth = (username, password) if username else None
         try:
             response = http.request(url, auth=auth, etag=etag, last_modified=last_modified, auth_url=auth_url,
-                                    auth_on_challenge=True,
                                     headers={"Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, "
                                                        "text/xml;q=0.8, */*;q=0.5"})
         except http.HttpError as error:
             if error.status == 401:
-                raise AuthRequired(url) from None
+                raise AuthRequired(error.final_url or url) from None
             raise
         return response
 
@@ -333,10 +333,15 @@ class Library:
                 self.db.update_feed(feed_id, last_refresh=now_s(), refresh_error="")
                 result.not_modified = True
                 return result
-            except AuthRequired:
-                result.error = _("Authentication error. Make sure that username and password are correct.")
-                self._refresh_failed(feed, result.error, "HTTP 401")
-                bus.emit("auth-required", feed_id)
+            except AuthRequired as error:
+                # A host the feed redirects to never gets the podcast's password, so entering it again would not
+                # help: name the host that asks instead.
+                withheld = http.withheld(feed.url, error.url)
+                result.error = withheld or _("Authentication error. Make sure that username and password are "
+                                             "correct.")
+                self._refresh_failed(feed, result.error, f"HTTP 401: {error.url}" if withheld else "HTTP 401")
+                if not withheld:
+                    bus.emit("auth-required", feed_id)
                 return result
             except http.HttpError as error:
                 result.error = str(error)
@@ -373,8 +378,8 @@ class Library:
             return
         if feed.username and not http.auth_allowed(feed.url, new_url):
             # Its password would go to the new host with every refresh. The old address still answers or
-            # redirects (the new host gets the password only when it asks for it over https); moving to another
-            # host is up to the user, by editing the address.
+            # redirects (the new host never gets the password); moving to another host is up to the user, by
+            # editing the address.
             return
         self.db.update_feed(feed.id, url=new_url)
         if feed.state == FEED_SUBSCRIBED:

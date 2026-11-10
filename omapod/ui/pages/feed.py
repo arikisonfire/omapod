@@ -68,7 +68,8 @@ class FeedPage(EpisodeListPage):
         self.preview_banner = Adw.Banner(title=_("You are not subscribed to this podcast yet. Subscribe to keep its "
                                                  "episodes up to date and see it in your library."))
         self.top.prepend(self.preview_banner)
-        self.error_banner = Adw.Banner(button_label=_("Details"))
+        # Plain text: the reason can name a host that a redirect chose.
+        self.error_banner = Adw.Banner(button_label=_("Details"), use_markup=False)
         self.error_banner.connect("button-clicked", lambda _b: self._show_error())
         self.top.prepend(self.error_banner)
 

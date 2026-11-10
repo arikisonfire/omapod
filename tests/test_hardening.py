@@ -164,7 +164,9 @@ class CredentialsStayWithTheirHost(Servers):
         self.assertEqual(response.body, b"<rss/>")
         self.assertEqual(response.permanent_url, server.base + "/new.xml")
 
-    def test_https_host_that_asks_gets_the_podcast_password_plain_http_never(self):
+    def test_no_other_host_gets_the_podcast_password_even_when_it_asks(self):
+        """Marketplace review of 0.1.0 (Medium): another https host that answered 401 got the podcast's username
+        and password, directly or at the end of a redirect."""
         from omapod.net import http
 
         tls = self.trusted_tls()
@@ -174,22 +176,24 @@ class CredentialsStayWithTheirHost(Servers):
             host.private.add("/ep.mp3")
         stats.routes["/r/cdn.mp3"] = (302, {"Location": cdn.base + "/ep.mp3"}, b"")
         stats.routes["/r/plain.mp3"] = (302, {"Location": plain.base + "/ep.mp3"}, b"")
-        options = {"auth": ("user", "pass"), "auth_url": "https://podcast.example/feed.xml", "auth_on_challenge": True}
-        response, chain = http.open_url(stats.base + "/r/cdn.mp3", **options)
-        with response:
-            self.assertEqual(response.read(), b"audio")
-        self.assertEqual(chain, [(302, cdn.base + "/ep.mp3")])
-        self.assertEqual(cdn.credentials(), [None, AUTH])  # only once it asked
-        with self.assertRaises(urllib.error.HTTPError) as caught:
-            http.open_url(stats.base + "/r/plain.mp3", **options)
-        caught.exception.close()
-        self.assertEqual(plain.credentials(), [None])
-        self.assertEqual(stats.credentials(), [None, None])
-        # Without auth_on_challenge (sync servers) nobody else gets them.
-        with self.assertRaises(urllib.error.HTTPError) as caught:
-            http.open_url(stats.base + "/r/cdn.mp3", auth=("user", "pass"), auth_url="https://podcast.example/")
-        caught.exception.close()
-        self.assertEqual(cdn.credentials(), [None, AUTH, None])
+        login = {"auth": ("user", "pass"), "auth_url": "https://podcast.example/feed.xml"}
+        for address, asks in ((cdn.base + "/ep.mp3", cdn), (stats.base + "/r/cdn.mp3", cdn),
+                              (stats.base + "/r/plain.mp3", plain)):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                http.open_url(address, **login)
+            caught.exception.close()
+            self.assertEqual((caught.exception.code, caught.exception.geturl()), (401, asks.base + "/ep.mp3"))
+            with self.assertRaises(http.HttpError) as caught:
+                http.request(address, **login)
+            self.assertEqual((caught.exception.status, caught.exception.final_url), (401, asks.base + "/ep.mp3"))
+        self.assertEqual(cdn.credentials(), [None] * 4)
+        self.assertEqual(plain.credentials(), [None] * 2)
+        self.assertEqual(stats.credentials(), [None] * 4)
+        self.assertEqual(http.withheld(login["auth_url"], cdn.base + "/ep.mp3"),
+                         "localhost asks for a password, but omaPOD sends this podcast's password only to "
+                         "podcast.example.")
+        self.assertEqual(http.withheld(login["auth_url"], "https://podcast.example/ep.mp3"), "")
+        self.assertEqual(http.withheld("http://podcast.example/feed.xml", "https://podcast.example/ep.mp3"), "")
 
     def test_downloads_send_the_podcast_password_only_to_its_host(self):
         from omapod.models import FEED_SUBSCRIBED
@@ -217,7 +221,39 @@ class CredentialsStayWithTheirHost(Servers):
         self.assertEqual(podcast.credentials("/own.mp3"), [AUTH])
         self.assertEqual(media.credentials("/elsewhere.mp3"), [None])
 
-    def test_stream_address_carries_the_password_only_where_it_may_be_asked_for(self):
+    def test_downloads_never_answer_another_host_that_asks_for_the_password(self):
+        """Marketplace review of 0.1.0 (Medium): a media host linked by a protected feed answered 401 and
+        received the podcast's username and password."""
+        from omapod.models import FEED_SUBSCRIBED
+        from omapod.net.downloads import DownloadManager
+
+        tls = self.trusted_tls()
+        podcast, media = self.host(), self.host("localhost", tls)
+        media.routes["/ep.mp3"] = (200, {"Content-Type": "audio/mpeg"}, b"audio")
+        media.private.add("/ep.mp3")
+        podcast.routes["/stats/ep.mp3"] = (302, {"Location": media.base + "/ep.mp3"}, b"")
+        with self.db.tx() as conn:
+            feed_id = self.db.insert_feed(conn, {"url": podcast.base + "/feed.xml", "title": "Private",
+                                                 "state": FEED_SUBSCRIBED, "username": "user", "password": "pass"})
+            ids = [self.db.insert_episode(conn, {"feed_id": feed_id, "guid": url, "title": url, "media_url": url,
+                                                 "media_type": "audio/mpeg"})
+                   for url in (media.base + "/ep.mp3", podcast.base + "/stats/ep.mp3")]
+        manager = DownloadManager(self.library, self.settings)
+        self.library.downloads = manager
+        manager.start()
+        self.addCleanup(manager.stop)
+        self.library.download(ids)
+        deadline = time.monotonic() + 15
+        while manager.active_ids() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(any(e.is_downloaded for e in self.db.get_episodes_by_ids(ids)))
+        self.assertEqual(media.credentials(), [None, None])
+        self.assertEqual(podcast.credentials(), [AUTH])  # its own server, where the statistics prefix starts
+        self.assertEqual({row["reason"] for row in self.db.get_log()},
+                         {"localhost asks for a password, but omaPOD sends this podcast's password only to "
+                          "127.0.0.1."})
+
+    def test_stream_address_carries_the_password_only_to_the_podcasts_own_server(self):
         from omapod import config
         from omapod.models import Episode, Feed
         from omapod.player.controller import PlayerController
@@ -227,11 +263,15 @@ class CredentialsStayWithTheirHost(Servers):
         for media, expected in (
                 ("https://podcast.example/ep.mp3", "https://us%20er:p%40ss%3Aword@podcast.example/ep.mp3"),
                 ("http://podcast.example/ep.mp3", "http://podcast.example/ep.mp3"),  # https feed: not in plain text
-                ("https://cdn.example/ep.mp3", "https://us%20er:p%40ss%3Aword@cdn.example/ep.mp3"),
+                ("https://cdn.example/ep.mp3", "https://cdn.example/ep.mp3"),  # marketplace review of 0.1.0
                 ("http://cdn.example/ep.mp3", "http://cdn.example/ep.mp3"),
+                ("https://podcast.example:8443/ep.mp3", "https://podcast.example:8443/ep.mp3"),
                 ("https://own:login@cdn.example/ep.mp3", "https://own:login@cdn.example/ep.mp3")):
             player.episode = Episode(media_url=media)
             self.assertEqual(player._source(), expected)
+        player.feed = Feed(url="http://podcast.example/feed.xml", username="user", password="pass")
+        player.episode = Episode(media_url="https://podcast.example/ep.mp3")  # the same server over TLS
+        self.assertEqual(player._source(), "https://user:pass@podcast.example/ep.mp3")
 
     @unittest.skipUnless(shutil.which("mpv"), "mpv not installed")
     def test_stream_redirected_to_another_host_does_not_take_the_password_along(self):
@@ -285,6 +325,46 @@ class CredentialsStayWithTheirHost(Servers):
         protected = self.library.preview(podcast.base + "/feed.xml", "user", "pass")
         self.assertFalse(self.library.refresh_feed(protected, force=True).error)
         self.assertEqual(self.db.get_feed(protected).url, podcast.base + "/feed.xml")
+
+    def test_feed_redirected_to_another_host_that_asks_never_sends_it_the_password(self):
+        """The marketplace finding for feeds: subscribing names the host that asks, and the password entered
+        there belongs to that host; a subscribed podcast's password stays with its own server."""
+        from omapod.core.library import AuthRequired
+        from omapod.events import bus
+        from omapod.models import FEED_SUBSCRIBED
+
+        tls = self.trusted_tls()
+        podcast, other = self.host(), self.host("localhost", tls)
+        other.routes["/feed.xml"] = (200, {"Content-Type": "application/rss+xml"},
+                                     FEED.replace(b"MEDIA", other.base.encode() + b"/one.mp3"))
+        other.private.add("/feed.xml")
+        podcast.routes["/feed.xml"] = (302, {"Location": other.base + "/feed.xml"}, b"")
+        with self.assertRaises(AuthRequired) as caught:
+            self.library.preview(podcast.base + "/feed.xml")
+        self.assertEqual(caught.exception.url, other.base + "/feed.xml")
+        feed_id = self.library.preview(caught.exception.url, "user", "pass")
+        self.assertEqual(self.db.get_feed(feed_id).url, other.base + "/feed.xml")
+        self.assertEqual(other.credentials(), [None, AUTH])
+        # A subscribed podcast whose server now redirects there: the other host gets nothing, and no login
+        # dialog opens, as a password entered for this podcast would not go there either.
+        with self.db.tx() as conn:
+            moved = self.db.insert_feed(conn, {"url": podcast.base + "/feed.xml", "title": "Private",
+                                               "state": FEED_SUBSCRIBED, "username": "user", "password": "pass"})
+        dialogs = []
+        self.addCleanup(bus.unsubscribe, bus.subscribe("auth-required", dialogs.append))
+        result = self.library.refresh_feed(moved, force=True)
+        self.assertEqual(result.error, "localhost asks for a password, but omaPOD sends this podcast's password "
+                                       "only to 127.0.0.1.")
+        self.assertEqual(dialogs, [])
+        self.assertEqual(other.credentials(), [None, AUTH, None])
+        self.assertEqual(podcast.credentials(), [None, AUTH])
+        # Its own server asking is a wrong password: that one the dialog can fix.
+        podcast.routes["/feed.xml"] = (200, {"Content-Type": "application/rss+xml"}, b"<rss/>")
+        podcast.private.add("/feed.xml")
+        self.library.update_feed_settings(moved, password="wrong")
+        result = self.library.refresh_feed(moved, force=True)
+        self.assertEqual(result.error, "Authentication error. Make sure that username and password are correct.")
+        self.assertEqual(dialogs, [moved])
 
 
 class TunnelProxy:
@@ -1155,17 +1235,6 @@ class ProxyLogin(Servers):
         self.assertEqual(response.body, b"ok")
         self.assertEqual(self.proxy.header("Proxy-Authorization"), [self.login])
         self.assertEqual(target.header("Proxy-Authorization"), [None])
-
-    def test_asking_again_with_the_podcast_password_leaves_the_proxy_password_behind(self):
-        from omapod.net import http
-
-        request = http._prepare("https://cdn.example/episode.mp3", "GET", {}, None, ("user", "pass"),
-                                "https://podcast.example/feed")
-        request.add_header("Proxy-Authorization", self.login)  # as urllib's ProxyHandler adds it
-        asked = urllib.error.HTTPError("https://cdn.example/episode.mp3", 401, "Unauthorized", {}, None)
-        retry = http._retry_with_auth(request, asked)
-        self.assertNotIn("Proxy-authorization", retry.headers)  # urllib's spelling of header names
-        self.assertEqual(retry.unredirected_hdrs.get("Authorization"), http.basic_auth("user", "pass"))
 
 
 class SearchResults(Servers):

@@ -177,17 +177,20 @@ class DownloadManager:
         headers = {"Accept": "*/*"}
         if offset:
             headers["Range"] = f"bytes={offset}-"
-        # The podcast's password goes to its own host; media hosts (statistics services, CDNs) get it only when
-        # they ask for it over https.
+        # The podcast's password goes only to its own server, also at the end of a redirect (statistics prefixes).
+        # Media hosts elsewhere (CDNs, statistics services) never get it, not even when they ask for it.
         auth = (feed.username, feed.password) if feed.username else None
         try:
             response, _chain = http.open_url(episode.media_url, headers=headers, auth=auth, auth_url=feed.url,
-                                             auth_on_challenge=True, timeout=30)
+                                             timeout=30)
         except urllib.error.HTTPError as error:
+            error.close()
             if error.code == 416 and offset:
                 os.truncate(part, 0)  # stays locked: the same file starts again
                 return self._fetch(job, episode, feed, part)
             reason, detail = http.describe_error(error, episode.media_url)
+            if error.code == 401:
+                reason = http.withheld(feed.url, error.geturl()) or reason
             self.library.download_failed(episode.id, reason, detail, job.manual)
             return
         except Exception as error:

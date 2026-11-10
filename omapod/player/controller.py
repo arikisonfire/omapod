@@ -293,10 +293,10 @@ class PlayerController:
         if parts.scheme.lower() not in ("http", "https"):
             return None
         if (self.feed is not None and self.feed.username and not parts.username
-                and (auth_allowed(self.feed.url, url) or parts.scheme == "https")):
-            # As user:password in the address, not as a header: ffmpeg sends a header to every host a redirect
-            # points to, but address credentials only to that host and only once it asks for them (401). So the
-            # podcast's own server gets them, and an https media host that asks; statistics services never.
+                and auth_allowed(self.feed.url, url)):
+            # Only for the podcast's own server, and as user:password in the address, not as a header: ffmpeg
+            # sends a header to every host a redirect points to, but address credentials only to that host and
+            # only once it asks for them (401). Media hosts elsewhere never get them, not even when they ask.
             userinfo = f"{quote(self.feed.username, safe='')}:{quote(self.feed.password or '', safe='')}@"
             url = urlunsplit(parts._replace(netloc=userinfo + parts.netloc))
         return url
