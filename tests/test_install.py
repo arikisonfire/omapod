@@ -85,6 +85,7 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(app.resolve(), self.plugin.resolve())  # omarchy plugin update updates what runs
         launcher = self.home / ".local" / "bin" / "omapod"
         self.assertIn("PYTHONPYCACHEPREFIX", launcher.read_text())
+        self.assertIn('exec python3 -P -m omapod "$@"', launcher.read_text())  # see LaunchersTest
         self.assertTrue((self.home / ".config" / "systemd" / "user" / "omapod-refresh.timer").exists())
         done = subprocess.run([str(launcher), "--version"], env=self.env, capture_output=True, text=True, timeout=60)
         self.assertEqual(done.stdout.strip(), "omaPOD " + json.loads((ROOT / "manifest.json").read_text())["version"])
@@ -99,6 +100,31 @@ class InstallerTest(unittest.TestCase):
         self.assertIn("--uninstall", usage)
         self.assertIn("marketplace", usage)
         self.assertNotIn("set -euo", usage)
+
+
+class LaunchersTest(unittest.TestCase):
+    """python3 -m puts the working directory first on the module path, and omaPOD is mostly started from the home
+    folder. Every way of starting it passes -P, which leaves the working directory out."""
+
+    def test_every_launcher_passes_minus_p(self):
+        self.assertIn('"PYTHONPATH=" + root.appDir, "python3", "-P", "-m", "omapod"]',
+                      (ROOT / "plugin" / "BarWidget.qml").read_text())
+        installer = (ROOT / "install.sh").read_text()
+        self.assertIn('exec python3 -P -m omapod "\\$@"', installer)
+        self.assertIn("python3 -P - <<'PY'", installer)
+        self.assertIn('[sys.executable, "-P", "-m", "omapod"]', (ROOT / "omapod" / "__main__.py").read_text())
+
+    def test_a_module_in_the_working_directory_does_not_run(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "json.py").write_text("open(__file__ + '.ran', 'w').close()\n")  # omaPOD imports json first
+            env = dict(os.environ, PYTHONPATH=str(ROOT), PYTHONDONTWRITEBYTECODE="1")
+            for flags, runs in ((["-P"], False), ([], True)):
+                done = subprocess.run(["python3", *flags, "-m", "omapod", "--version"], cwd=folder, env=env,
+                                      capture_output=True, text=True, timeout=60)
+                self.assertEqual(Path(folder, "json.py.ran").exists(), runs, flags)
+                self.assertEqual(done.returncode, 0, done.stderr)
 
 
 if __name__ == "__main__":

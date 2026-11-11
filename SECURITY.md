@@ -32,8 +32,10 @@ by your user only (0600) before it writes the first byte, and puts it in place o
 **Importing a database** replaces the library with a file that may come from anywhere. omaPOD reads it with
 SQLite's precautions for untrusted files and accepts it only if it passes the integrity check and holds nothing
 but tables and indexes (no triggers, views or virtual tables). Downloads it lists that are not in your download
-folder (or, for a local folder, not in that folder) are forgotten, so the import cannot point omaPOD at your
-other files.
+folder are forgotten, so the import cannot point omaPOD at your other files. If you chose a download folder of
+your own, which may hold other files too, the import keeps only the downloads your current library already has.
+Podcasts of local folders come along with their history, but not the permission to use their folders (see
+[Your files](#your-files)).
 
 ## Network connections
 
@@ -62,7 +64,10 @@ system's proxy settings instead.
   them, not even one that asks for them (HTTP 401); a download from such a server fails with a message that
   names it. Redirects never carry them elsewhere, and a protected podcast never moves to another host on its own.
   If the address you subscribe to redirects to another server that asks for a password, the login dialog names
-  that server; the podcast is then subscribed at its address, and the password goes to that server only.
+  that server; the podcast is then subscribed at its address, and the password goes to that server only. For an
+  address with `http://` the login dialog and the podcast's settings say that the password would travel
+  unencrypted. A login written into an address you add (`https://user:password@host/feed`) becomes the
+  podcast's login and is taken out of the address, which goes to the sync server and into exports.
 - **Sync:** TLS certificates are checked. A certificate your system does not trust (self-signed, your own
   certificate authority) is accepted only after you have seen its SHA-256 fingerprint and confirmed it, and
   from then on only exactly that certificate. For an address typed without `http://` or `https://`, omaPOD uses
@@ -79,7 +84,8 @@ system's proxy settings instead.
 - **MPRIS:** while something is loaded, every program on your session bus can read the episode title, the
   podcast's name, the first 300 characters of the show notes, a cover thumbnail from omaPOD's cache and, for a
   downloaded episode, its file path. This is how media keys and Omarchy's media widget work. Stream addresses
-  are not shared, as those of private feeds often carry an access token.
+  are not shared, as those of private feeds often carry an access token. Programs on the bus can control
+  playback, but not make omaPOD open an address (MPRIS `OpenUri` is not supported).
 - **Links** in show notes and podcast pages open only if they are web (http, https) or mail links; anything
   else is copied to the clipboard instead.
 - **The bar widget** runs inside the Omarchy shell and reads omaPOD's state from a socket only your user can
@@ -94,10 +100,15 @@ omaPOD deletes and moves only its own downloads: files in a podcast's folder ins
 (`<download folder>/<podcast>/<file>`). If an episode names a file anywhere else, deleting the download only
 makes omaPOD forget it; the file stays where it is.
 
-Episodes of a local folder you added are your own files. omaPOD never deletes them on its own: **Delete
-download** asks first and moves them to the trash, **Delete played downloads** leaves them alone, and automatic
-deletion skips them unless you switch on **Auto delete from local folders** (then they go to the trash too).
-Only files inside that folder go to the trash.
+Episodes of a local folder you added are your own files. omaPOD reads a folder only after you have chosen it
+under **Add podcast → Add local folder** on this computer. That choice is kept in `settings.json`, never in the
+library, so an imported database cannot bring folders of its own: its local podcasts wait until you choose their
+folder here. Removing the podcast withdraws the permission. omaPOD never deletes these files on its own:
+**Delete download** asks first, naming the file, and moves it to the trash, **Delete played downloads** leaves
+them alone, and automatic deletion skips them unless you switch on **Auto delete from local folders** (then they
+go to the trash too). Only audio and video files inside a folder you chose go to the trash, and which files those
+are omaPOD learns from the folder itself, not from its database. Pictures on your disk are read only as covers
+of these folders.
 
 ## Limits by design
 

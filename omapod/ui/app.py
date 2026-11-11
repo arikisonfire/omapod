@@ -127,6 +127,7 @@ class OmaPodApp(Adw.Application):
         move_secrets(self.settings, self.credentials)
         self.db = Database(paths.db)
         self.library = Library(self.db, self.settings)
+        self.library.forget_unused_folders()  # after a database import, too (see __main__._apply_pending_import)
         self.images = ImageCache(paths.images)
         self.textures = TextureCache(self.images)
         self.downloads = DownloadManager(self.library, self.settings)
@@ -548,9 +549,10 @@ class OmaPodApp(Adw.Application):
         from .widgets.common import confirm
 
         folders = sorted({os.path.dirname(e.file_path) for e in local})
+        # The file's own name and folder, not the episode's title: that is what goes to the trash.
         body = ngettext("{name} is a file in a folder you added, not a download. omaPOD moves it to the trash.",
                         "{n} episodes are files in a folder you added, not downloads. omaPOD moves them to the "
-                        "trash.", len(local)).format(name=local[0].title, n=len(local))
+                        "trash.", len(local)).format(name=os.path.basename(local[0].file_path), n=len(local))
         body += "\n\n" + "\n".join(folders[:3] + (["…"] if len(folders) > 3 else []))
         confirm(self.window, ngettext("Move the file to the trash?", "Move {n} files to the trash?",
                                       len(local)).format(n=len(local)),
@@ -722,7 +724,8 @@ class OmaPodApp(Adw.Application):
             run_in_thread(lambda: self.library.refresh_feed(feed_id, force=True))
 
         # The host the password goes to, not the title, which the feed chooses.
-        ask_credentials(self.window, urlsplit(feed.url).hostname or feed.url, retry, feed.username)
+        ask_credentials(self.window, urlsplit(feed.url).hostname or feed.url, retry, feed.username,
+                        plain=urlsplit(feed.url).scheme.lower() == "http")
 
     # ------------------------------------------------------------ subscribing
 
@@ -764,7 +767,8 @@ class OmaPodApp(Adw.Application):
                 # password entered there goes only to that host (the podcast is subscribed at that address).
                 asked = error.url or url
                 ask_credentials(self.window, urlsplit(asked).hostname or asked,
-                                lambda u, p: self.preview_url(asked, u, p, on_done))
+                                lambda u, p: self.preview_url(asked, u, p, on_done),
+                                plain=urlsplit(asked).scheme.lower() == "http")
             elif isinstance(error, NotAFeedError) and error.candidates:
                 from .dialogs import choose_feed
 

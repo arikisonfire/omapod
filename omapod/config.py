@@ -173,6 +173,8 @@ DEFAULTS = {
     "episode_cache": 25,
     "auto_delete": False,
     "auto_delete_local": False,
+    # Folders the user chose under Add local folder on this computer (see trusted_folders).
+    "local_folders": [],
     "favorite_keeps_episode": True,
     "episode_cleanup": -2,
     "delete_removes_from_queue": False,
@@ -450,6 +452,12 @@ def downloads_dir():
     return Path(custom).expanduser() if custom else paths.default_downloads
 
 
+def own_downloads_dir():
+    """Whether downloads go to omaPOD's own folder in its data folder, which holds nothing but downloads. A folder
+    the user chose may hold other files as well."""
+    return downloads_dir() == paths.default_downloads
+
+
 def in_folder(path, folder):
     """Whether the file `path` lies somewhere in `folder`, judged by the folder it is in, with symbolic links
     resolved. The file itself may be a link: deleting, moving or trashing it affects only the link."""
@@ -470,13 +478,52 @@ def is_download(path):
     return os.path.dirname(parent) == os.path.realpath(downloads_dir())
 
 
-def owns_file(path, feed_url):
-    """Whether the file an episode names is one omaPOD may delete, move or trash: a download in the download
-    folder, or for a podcast made from an added folder (feed address local:<folder>), a file in that folder."""
+def trusted_folders():
+    """The folders the user chose under Add local folder on this computer, as their podcasts' addresses name them
+    (local:<folder>). Only these are read as podcasts, and only their files may go to the trash. The list is kept
+    in the settings, which a database import does not replace: an imported library brings podcasts of folders,
+    never the permission to use them, so the folder has to be chosen here first."""
+    value = settings().get("local_folders")
+    return [folder for folder in value if isinstance(folder, str) and folder] if isinstance(value, list) else []
+
+
+def trust_folder(folder, trusted=True):
+    """Grants (when the user chose the folder) or withdraws (when its podcast goes) the permission above."""
+    current = trusted_folders()
+    if trusted and folder not in current:
+        settings().set("local_folders", current + [folder])
+    elif not trusted and folder in current:
+        settings().set("local_folders", [entry for entry in current if entry != folder])
+
+
+def chosen_folder(feed_url):
+    """The folder of a podcast made from an added folder (feed address local:<folder>) if the user chose that
+    folder on this computer, else ""."""
     from .models import LOCAL_PREFIX
 
     if isinstance(feed_url, str) and feed_url.startswith(LOCAL_PREFIX):
-        return in_folder(path, feed_url[len(LOCAL_PREFIX):])
+        folder = feed_url[len(LOCAL_PREFIX):]
+        if folder in trusted_folders():
+            return folder
+    return ""
+
+
+def in_chosen_folder(path):
+    """Whether `path` lies in one of the folders the user chose (cover pictures of added folders)."""
+    return any(in_folder(path, folder) for folder in trusted_folders())
+
+
+def owns_file(path, feed_url):
+    """Whether the file an episode names is one omaPOD may delete, move or trash: a download in the download
+    folder, or for a podcast made from a folder the user chose here (see trusted_folders), an audio or video file
+    in that folder. The database names the files and, for added folders, the folder too; an imported backup could
+    name any of the user's files or folders."""
+    from .models import AUDIO_EXTENSIONS, LOCAL_PREFIX, VIDEO_EXTENSIONS
+
+    if isinstance(feed_url, str) and feed_url.startswith(LOCAL_PREFIX):
+        folder = chosen_folder(feed_url)
+        return (bool(folder) and in_folder(path, folder)
+                and os.path.splitext(path)[1].lower() in AUDIO_EXTENSIONS + VIDEO_EXTENSIONS)
     return is_download(path)
 
 

@@ -487,8 +487,8 @@ class Database:
 
     def feed_episode_rows(self, conn, feed_id):
         return conn.execute(
-            "SELECT id, guid, title, media_url, pub_date, state, file_path, duration, media_size, image_url, "
-            "link, description, media_type, chapters_url, chapters_type, transcript_url, transcript_type, "
+            "SELECT id, guid, title, media_url, pub_date, state, file_path, downloaded_at, duration, media_size, "
+            "image_url, link, description, media_type, chapters_url, chapters_type, transcript_url, transcript_type, "
             "psc_chapters, season, episode_number, episode_type, social_url FROM episodes WHERE feed_id = ?",
             (feed_id,),
         ).fetchall()

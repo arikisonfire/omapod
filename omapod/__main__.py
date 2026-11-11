@@ -21,24 +21,25 @@ def _apply_pending_import():
     if not os.path.exists(pending):
         return
     if os.path.exists(paths.db):
+        import sqlite3
+
+        from .config import private_file
+
         backup = str(paths.db) + time.strftime(".before-import-%Y%m%d-%H%M%S")
-        try:
-            # Through SQLite, so the copy includes what is still in the write-ahead log (deleted below).
-            import sqlite3
-
-            current, copy = sqlite3.connect(paths.db), sqlite3.connect(backup)
+        # Private from its first byte, like every copy of the library (config.private_file).
+        with private_file(backup) as path:
             try:
-                current.backup(copy)
-            finally:
-                copy.close()
-                current.close()
-        except sqlite3.Error:
-            import shutil
+                # Through SQLite, so the copy includes what is still in the write-ahead log (deleted below).
+                current, copy = sqlite3.connect(paths.db), sqlite3.connect(path)
+                try:
+                    current.backup(copy)
+                finally:
+                    copy.close()
+                    current.close()
+            except sqlite3.Error:
+                import shutil
 
-            shutil.copy2(paths.db, backup)
-        from .db import make_private
-
-        make_private(backup)
+                shutil.copyfile(paths.db, path)
     for suffix in ("-wal", "-shm"):
         try:
             os.unlink(str(paths.db) + suffix)
@@ -117,6 +118,7 @@ def _headless_refresh():
     set_language(store.get("language"))
     db = Database(paths.db)
     library = Library(db, store)
+    library.forget_unused_folders()
     downloads = DownloadManager(library, store)
     library.downloads = downloads
     downloads.start()
@@ -186,7 +188,7 @@ def main(argv=None):
         # start (see _apply_pending_import).
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         env = dict(os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", ""))
-        os.execve(sys.executable, [sys.executable, "-m", "omapod"], env)
+        os.execve(sys.executable, [sys.executable, "-P", "-m", "omapod"], env)  # -P: as the launchers start it
     return code
 
 

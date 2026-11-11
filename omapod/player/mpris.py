@@ -164,9 +164,9 @@ class Mpris:
             "HasTrackList": GLib.Variant("b", False),
             "Identity": GLib.Variant("s", APP_NAME),
             "DesktopEntry": GLib.Variant("s", APP_ID),
-            "SupportedUriSchemes": GLib.Variant("as", ["http", "https", "file"]),
-            "SupportedMimeTypes": GLib.Variant("as", ["audio/mpeg", "audio/mp4", "audio/ogg", "audio/opus",
-                                                      "audio/flac", "video/mp4"]),
+            # None: OpenUri opens nothing (see _method).
+            "SupportedUriSchemes": GLib.Variant("as", []),
+            "SupportedMimeTypes": GLib.Variant("as", []),
         }
 
     def _get(self, _connection, _sender, _path, interface, name):
@@ -210,7 +210,11 @@ class Mpris:
             if track == self._track_id():
                 player.seek(position // 1000)
         elif method == "OpenUri":
-            self.app.open_uri(params.unpack()[0])
+            # Any program on the session bus could call it. omaPOD plays episodes of its library only, and opening
+            # the address in the browser instead (or copying it to the clipboard) is not what the caller asked for.
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.NotSupported",
+                                         "omaPOD plays only episodes of its library")
+            return
         invocation.return_value(None)
 
     # ------------------------------------------------------------ change signals

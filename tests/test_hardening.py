@@ -222,6 +222,37 @@ class CredentialsStayWithTheirHost(Servers):
         self.assertEqual(podcast.credentials("/own.mp3"), [AUTH])
         self.assertEqual(media.credentials("/elsewhere.mp3"), [None])
 
+    def test_a_login_in_the_address_becomes_the_podcasts_login(self):
+        """https://user:pass@host/feed was kept as the podcast's address, password and all: it went to the sync
+        server (gpodder.net is a public service), into exports and the download log. And downloads from the
+        podcast's own server went without the password."""
+        from omapod.net.downloads import DownloadManager
+
+        server = self.host()
+        server.routes["/feed.xml"] = (200, {"Content-Type": "application/rss+xml"},
+                                      FEED.replace(b"MEDIA", f"{server.base}/ep.mp3".encode()))
+        server.routes["/ep.mp3"] = (200, {"Content-Type": "audio/mpeg"}, b"audio")
+        server.private.update({"/feed.xml", "/ep.mp3"})
+        self.settings.set("sync_provider", "nextcloud")  # subscribing then queues the address for the server
+        feed_id = self.library.subscribe_url(server.base.replace("://", "://user:pass@") + "/feed.xml")
+        feed = self.db.get_feed(feed_id)
+        self.assertEqual((feed.url, feed.username, feed.password), (server.base + "/feed.xml", "user", "pass"))
+        self.assertEqual([payload["url"] for _id, payload in self.db.sync_pending("sub")], [feed.url])
+        manager = DownloadManager(self.library, self.settings)
+        self.library.downloads = manager
+        manager.start()
+        self.addCleanup(manager.stop)
+        ids = [e.id for e in self.db.get_episodes(feed_id=feed_id)]
+        self.library.download(ids)
+        deadline = time.monotonic() + 15
+        while manager.active_ids() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(all(e.is_downloaded for e in self.db.get_episodes_by_ids(ids)), self.db.get_log())
+        self.assertEqual(server.credentials("/ep.mp3"), [AUTH])
+        self.library.edit_feed_url(feed_id, "https://other:secret@[::1]:8443/feed.xml")
+        self.assertEqual(self.db.get_feed(feed_id).url, "https://[::1]:8443/feed.xml")
+        self.assertEqual((self.db.get_feed(feed_id).username, self.db.get_feed(feed_id).password), ("other", "secret"))
+
     def test_downloads_never_answer_another_host_that_asks_for_the_password(self):
         """Marketplace review of 0.1.0 (Medium): a media host linked by a protected feed answered 401 and
         received the podcast's username and password."""
@@ -698,8 +729,12 @@ class Covers(unittest.TestCase):
         before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         done = threading.Event()
         result = []
-        cache.request(bomb.as_uri(), 256, lambda path: (result.append(path), done.set()))
-        self.assertTrue(done.wait(30))
+        # As the cover of a folder the user added: only those may be read from the disk (see ImportedFolders).
+        with mock.patch("omapod.core.images.in_chosen_folder", lambda path: True), \
+                mock.patch.object(cache, "_render", wraps=cache._render) as render:
+            cache.request(bomb.as_uri(), 256, lambda path: (result.append(path), done.set()))
+            self.assertTrue(done.wait(30))
+        render.assert_called_once()  # refused by its size, not because of where it is
         self.assertEqual(result, [None])
         grown_mb = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before) // 1024
         self.assertLess(grown_mb, 200, "the picture was decoded after all")
@@ -1023,9 +1058,8 @@ class DatabaseImport(unittest.TestCase):
         self.assertEqual(Path(backup).stat().st_mode & 0o777, 0o600)
 
 
-class ImportedBackups(Servers):
-    """Marketplace review of 0.1.1: the database names the files of downloads, and an imported backup can name any
-    file of the user. omaPOD deletes and moves only files in its download folder, and an import forgets the rest."""
+class Backups(Servers):
+    """A library that names the user's own files, as an imported backup can, and backups made of it."""
 
     def setUp(self):
         super().setUp()
@@ -1051,6 +1085,24 @@ class ImportedBackups(Servers):
                                                        "file_path": str(path), "downloaded_at": 1, "state": UNPLAYED,
                                                        **episode})
         return feed_id, episode_id
+
+    def backup(self, *statements):
+        """A database file as someone could hand it over: this library, plus `statements`."""
+        import sqlite3
+
+        path = Path(self.tmp) / f"backup-{len(statements)}-{time.monotonic_ns()}.db"
+        copy = sqlite3.connect(path)
+        self.db.conn().backup(copy)
+        for statement in statements:
+            copy.execute(statement)
+        copy.commit()
+        copy.close()
+        return str(path)
+
+
+class ImportedBackups(Backups):
+    """Marketplace review of 0.1.1: the database names the files of downloads, and an imported backup can name any
+    file of the user. omaPOD deletes and moves only files in its download folder, and an import forgets the rest."""
 
     def test_files_outside_the_download_folder_stay_whatever_removes_a_download(self):
         from omapod.config import downloads_dir
@@ -1095,18 +1147,23 @@ class ImportedBackups(Servers):
         self.assertFalse((moved / folder.name / "episode.mp3").exists())
         self.assertFalse(self.db.get_episode(episode_id).is_downloaded)
 
-    def backup(self, *statements):
-        """A database file as someone could hand it over: this library, plus `statements`."""
-        import sqlite3
-
-        path = Path(self.tmp) / f"backup-{len(statements)}-{time.monotonic_ns()}.db"
-        copy = sqlite3.connect(path)
-        self.db.conn().backup(copy)
-        for statement in statements:
-            copy.execute(statement)
-        copy.commit()
-        copy.close()
-        return str(path)
+    def test_changing_the_download_folder_never_replaces_a_file_there(self):
+        """The new folder may hold a file where a download would go (an old copy, a file of the user's): shutil.move
+        replaced it without a word."""
+        feed_id, episode_id = self.downloaded("")
+        folder = self.library.feed_folder(self.db.get_feed(feed_id))
+        folder.mkdir(parents=True)
+        (folder / "episode.mp3").write_bytes(b"the download")
+        self.db.update_episode(episode_id, file_path=str(folder / "episode.mp3"))
+        there = Path(self.tmp) / "home" / "Podcasts" / folder.name / "episode.mp3"
+        there.parent.mkdir(parents=True)
+        there.write_bytes(b"already there")
+        self.assertEqual(self.library.move_downloads(str(there.parents[1])), 1)
+        self.assertEqual(there.read_bytes(), b"already there")
+        moved = Path(self.db.get_episode(episode_id).file_path)
+        self.assertEqual((moved.name, moved.read_bytes()), ("episode (2).mp3", b"the download"))
+        self.assertEqual(self.library.move_downloads(str(there.parents[1])), 0)  # into the same folder: no change
+        self.assertEqual(Path(self.db.get_episode(episode_id).file_path), moved)
 
     def test_import_takes_only_plain_tables_and_forgets_foreign_files(self):
         import sqlite3
@@ -1147,6 +1204,163 @@ class ImportedBackups(Servers):
         data[(root - 1) * page_size] = 0x0f  # no valid page type for the episodes table's first page
         damaged.write_bytes(bytes(data))
         self.assertRegex(check_import(str(damaged)) or "", r"^This file is not an omaPOD database \(.+\)\.$")
+
+    def test_a_download_folder_of_ones_own_keeps_only_downloads_the_library_has(self):
+        """omaPOD's own download folder holds nothing but its downloads. One the user chose (here the music folder)
+        may hold other files two levels down, where podcasts keep their downloads."""
+        import sqlite3
+
+        from omapod.ui.preferences import prepare_import
+
+        music = Path(self.tmp) / "home" / "Music"
+        track = music / "Album" / "track.mp3"
+        track.parent.mkdir(parents=True)
+        track.write_bytes(b"a song")
+        self.settings.set("downloads_dir", str(music))
+        _feed, foreign = self.downloaded(track)
+        feed_id, own = self.downloaded("")
+        own_file = self.library.feed_folder(self.db.get_feed(feed_id)) / "episode.mp3"
+        own_file.parent.mkdir(parents=True)
+        own_file.write_bytes(b"audio")
+        self.db.update_episode(own, file_path=str(own_file))
+        path = self.backup()
+        self.assertIsNone(prepare_import(path, known={str(own_file)}))
+        rows = dict(sqlite3.connect(path).execute("SELECT id, file_path FROM episodes"))
+        self.assertEqual((rows[foreign], rows[own]), ("", str(own_file)))
+
+
+class ImportedFolders(Backups):
+    """Marketplace review of 0.1.2: an imported backup names the folders of its local podcasts too. omaPOD reads a
+    folder, and moves files of it to the trash, only once the user has chosen it on this computer; that choice is
+    kept in the settings, which an import does not replace."""
+
+    def setUp(self):
+        super().setUp()
+        self.song = Path(self.tmp) / "home" / "Music" / "song.mp3"  # the user's, and no download either
+        self.song.parent.mkdir(parents=True)
+        shutil.copy(FIX / "tone.mp3", self.song)
+        self.settings.set("auto_delete_local", True)  # the owner lets automatic deletion trash played files
+        self.trashed = []
+        patch = mock.patch("omapod.core.library.move_to_trash", self.trashed.append)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def imported_folder(self, folder, *paths, **feed):
+        """A podcast of `folder` as a library from elsewhere holds it, here as in the review (updates off, delete
+        after playing on), with `paths` as unplayed episodes whose files are downloaded."""
+        import os
+
+        from omapod.models import FEED_SUBSCRIBED, UNPLAYED
+
+        with self.db.tx() as conn:
+            feed_id = self.db.insert_feed(conn, {"url": f"local:{folder}", "title": "Folder", "state": FEED_SUBSCRIBED,
+                                                 "keep_updated": 0, "auto_delete": 1, **feed})
+            ids = [self.db.insert_episode(conn, {"feed_id": feed_id, "guid": os.path.relpath(path, folder),
+                                                 "title": Path(path).stem, "media_url": Path(path).as_uri(),
+                                                 "file_path": str(path), "downloaded_at": 1, "state": UNPLAYED})
+                   for path in paths]
+        return feed_id, ids
+
+    def test_a_backup_cannot_name_a_folder_of_its_own(self):
+        import sqlite3
+
+        from omapod.ui.preferences import prepare_import
+
+        home = self.song.parents[1]
+        feed_id, (episode,) = self.imported_folder(home, self.song)
+        path = self.backup()
+        self.assertIsNone(prepare_import(path))
+        self.assertEqual(sqlite3.connect(path).execute("SELECT file_path, downloaded_at FROM episodes WHERE id = ?",
+                                                       (episode,)).fetchone(), ("", 0))
+        # Had a library named the file all the same, nothing that removes downloads would touch it.
+        self.library.mark_feed_played(feed_id)  # the review's way: delete after playing, Mark all as played
+        self.settings.update({"episode_cache": 1, "episode_cleanup": -3})
+        for folder, remove in ((f"{home}/", lambda feed, ids: self.library.delete_downloads(ids, local_files=True)),
+                               (f"{home}/.", lambda feed, ids: self.library.cleanup(1)),
+                               (self.song.parent, lambda feed, ids: self.library.unsubscribe([feed]))):
+            with self.subTest(folder=str(folder)):
+                remove(*self.imported_folder(folder, self.song))
+        self.assertEqual(self.trashed, [])
+        self.assertTrue(self.song.exists())
+        # Nor is such a folder read: the music in it does not turn into episodes.
+        feed_id, _ids = self.imported_folder(f"{home}//", keep_updated=1)
+        self.assertEqual(self.library.refresh_feed(feed_id).error,
+                         "Choose this folder under Add podcast → Add local folder to use it on this computer.")
+        self.assertEqual(self.db.count_episodes(feed_id=feed_id), 0)
+
+    def test_choosing_the_folder_here_gives_its_podcast_its_files_back(self):
+        folder = Path(self.tmp) / "audiobooks"
+        folder.mkdir()
+        shutil.copy(FIX / "tone.mp3", folder / "chapter-01.mp3")
+        feed_id, (episode_id,) = self.imported_folder(folder, folder / "chapter-01.mp3")
+        # As the import leaves it, but with another file named: where the file is, the folder says.
+        self.db.update_episode(episode_id, file_path=str(self.song), downloaded_at=0, position=61000)
+        self.assertIn("Choose this folder", self.library.refresh_feed(feed_id).error)
+        self.assertEqual(self.library.add_local_folder(str(folder)), feed_id)
+        episode = self.db.get_episode(episode_id)
+        self.assertEqual((episode.file_path, episode.position), (str(folder / "chapter-01.mp3"), 61000))
+        self.assertTrue(episode.is_downloaded)
+        self.library.mark_feed_played(feed_id)
+        self.assertEqual(self.trashed, [str(folder / "chapter-01.mp3")])
+
+    def test_only_audio_and_video_files_of_a_chosen_folder_go_to_the_trash(self):
+        from omapod.config import owns_file
+
+        folder = Path(self.tmp) / "audiobooks"
+        folder.mkdir()
+        shutil.copy(FIX / "tone.mp3", folder / "chapter-01.mp3")
+        (folder / "notes.txt").write_text("mine")
+        feed_id = self.library.add_local_folder(str(folder))
+        url = f"local:{folder}"
+        self.assertEqual([owns_file(str(path), url) for path in (folder / "chapter-01.mp3", folder / "notes.txt",
+                                                                 self.song)], [True, False, False])
+        with self.db.tx() as conn:  # what an imported library could hold before the folder is read again
+            ids = [self.db.insert_episode(conn, {"feed_id": feed_id, "guid": str(path), "title": path.name,
+                                                 "file_path": str(path), "downloaded_at": 1})
+                   for path in (folder / "notes.txt", self.song)]
+        self.library.delete_downloads(ids, local_files=True)
+        self.assertEqual(self.trashed, [])
+        self.assertTrue((folder / "notes.txt").exists() and self.song.exists())
+
+    def test_permission_ends_with_the_podcast(self):
+        from omapod.config import trusted_folders
+
+        folder = Path(self.tmp) / "audiobooks"
+        folder.mkdir()
+        feed_id = self.library.add_local_folder(str(folder))
+        self.assertEqual(trusted_folders(), [str(folder)])
+        self.library.unsubscribe([feed_id])
+        self.assertEqual(trusted_folders(), [])
+        feed_id = self.library.add_local_folder(str(folder))
+        self.db.delete_feed(feed_id)  # a database import replaced the library
+        self.library.forget_unused_folders()  # at the next start
+        self.assertEqual(trusted_folders(), [])
+        imported, _ids = self.imported_folder(folder, keep_updated=1)  # a later import brings it back
+        self.assertIn("Choose this folder", self.library.refresh_feed(imported).error)
+
+    def test_pictures_on_the_disk_are_read_only_as_covers_of_chosen_folders(self):
+        import gi
+
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+
+        from omapod.core.images import ImageCache
+
+        folder = Path(self.tmp) / "audiobooks"
+        folder.mkdir()
+        self.library.add_local_folder(str(folder))
+        scan = self.documents / "scan.png"  # a picture of the user's that an imported library names as a cover
+        GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, 8, 8).savev(str(scan), "png", [], [])
+        self.assertEqual(ImageCache._local_path((folder / "cover.png").as_uri()), str(folder / "cover.png"))
+        self.assertEqual(ImageCache._local_path(scan.as_uri()), "")
+        self.assertEqual(ImageCache._local_path(str(scan)), "")
+        self.assertIsNone(ImageCache._local_path("https://podcast.example/cover.png"))
+        cache = ImageCache(Path(self.tmp) / "images")
+        done, result = threading.Event(), []
+        cache.request(scan.as_uri(), 64, lambda path: (result.append(path), done.set()))
+        self.assertTrue(done.wait(10))
+        self.assertEqual(result, [None])
+        self.assertEqual(list((Path(self.tmp) / "images").glob("*.png")), [])
 
 
 class TwoProcesses(Servers):
@@ -1419,6 +1633,27 @@ class FeedAddresses(unittest.TestCase):
         mpris.player = SimpleNamespace(episode=downloaded, duration=0)
         self.assertEqual(mpris._metadata()["xesam:url"].unpack(), Path(__file__).as_uri())
 
+    def test_other_programs_cannot_make_omapod_open_an_address(self):
+        """MPRIS OpenUri: any program on the session bus may call it. It used to hand the address to the browser, or
+        put it on the clipboard."""
+        from types import SimpleNamespace
+
+        from gi.repository import GLib
+
+        from omapod.player.mpris import Mpris
+
+        opened, answers = [], []
+        mpris = Mpris.__new__(Mpris)
+        mpris.app, mpris.player = SimpleNamespace(open_uri=opened.append), SimpleNamespace()
+        invocation = SimpleNamespace(return_dbus_error=lambda name, _text: answers.append(name),
+                                     return_value=answers.append)
+        for uri in ("https://tracker.example/?you", "file:///home/me/.bashrc", "javascript:alert(1)"):
+            mpris._method(None, ":1.42", "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", "OpenUri",
+                          GLib.Variant("(s)", (uri,)), invocation)
+        self.assertEqual(opened, [])
+        self.assertEqual(answers, ["org.freedesktop.DBus.Error.NotSupported"] * 3)
+        self.assertEqual(mpris._root_properties()["SupportedUriSchemes"].unpack(), [])
+
     def test_desktop_gets_only_web_and_mail_links(self):
         from types import SimpleNamespace
 
@@ -1617,6 +1852,30 @@ class RowsShowTextAsItIs(Servers):
         settings = dialogs.FeedSettingsDialog(ctx, feed_id)
         settings.present(ctx.window)  # its pages are put in place when it is shown
         self.assertIn(feed.display_title, shown(settings))
+
+
+class PlainTextLogins(unittest.TestCase):
+    """The sync login asks before it goes over http. A podcast's login says so too, when its address is http://."""
+
+    def test_a_password_for_an_unencrypted_address_comes_with_a_warning(self):
+        import gi
+
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Adw", "1")
+        from gi.repository import Adw, Gdk, Gtk
+
+        if Gdk.Display.get_default() is None:
+            self.skipTest("needs a display, e.g. xvfb-run")
+        Adw.init()
+        from omapod.ui.dialogs import ask_credentials
+
+        window = Gtk.Window()
+        plain = ask_credentials(window, "podcast.example", lambda *_a: None, plain=True)
+        secure = ask_credentials(window, "podcast.example", lambda *_a: None)
+        self.assertIn("not encrypted (http)", plain.get_body())
+        self.assertNotIn("not encrypted", secure.get_body())
+        self.assertEqual(plain.get_response_appearance("ok"), Adw.ResponseAppearance.DESTRUCTIVE)
+        self.assertEqual(secure.get_response_appearance("ok"), Adw.ResponseAppearance.SUGGESTED)
 
 
 if __name__ == "__main__":

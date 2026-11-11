@@ -274,13 +274,12 @@ def basic_auth(username, password):
 
 
 def split_userinfo(url):
-    """https://user:pass@host/feed -> (https://host/feed, user, pass)."""
+    """https://user:pass@host/feed -> (https://host/feed, user, pass). The host keeps its port and, for an IPv6
+    address, its brackets."""
     parts = urlsplit(url)
     if not parts.username:
         return url, "", ""
-    netloc = parts.hostname or ""
-    if parts.port:
-        netloc += f":{parts.port}"
+    netloc = parts.netloc.rpartition("@")[2]
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment)), \
         unquote(parts.username or ""), unquote(parts.password or "")
 

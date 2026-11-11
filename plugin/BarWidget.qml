@@ -134,11 +134,12 @@ Panel {
   onOpenedChanged: if (root.opened && !root.connected) root.checkInstalled()
 
   // What starting omaPOD runs. The bundled app keeps its bytecode in the cache: a file written under the plugins
-  // folder makes the shell reload every plugin.
+  // folder makes the shell reload every plugin. -P keeps the working directory (the home folder) out of Python's
+  // module path, so that a file there such as json.py cannot stand in for a module.
   function launchArgs() {
     if (root.bundled && root.launchCommand === root.defaultLaunchCommand)
       return ["uwsm-app", "--", "env", "PYTHONPYCACHEPREFIX=" + root.cacheDir + "/omapod/pycache",
-              "PYTHONPATH=" + root.appDir, "python3", "-m", "omapod"]
+              "PYTHONPATH=" + root.appDir, "python3", "-P", "-m", "omapod"]
     return ["sh", "-c", root.launchCommand]
   }
 

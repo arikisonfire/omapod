@@ -15,6 +15,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import unquote, urlsplit
 
+from ..config import in_chosen_folder
 from ..net import http
 from ..util import url_hash
 
@@ -100,18 +101,23 @@ class ImageCache:
 
     @staticmethod
     def _local_path(url):
+        """The file of a local picture (a file: address or a path), "" when omaPOD may not read it, None for any
+        other address. Local pictures are the covers of folders the user added here (config.in_chosen_folder): feeds
+        and search results are kept to web addresses, but an imported library can name any file."""
         if url.startswith("file://"):
-            return unquote(urlsplit(url).path)
-        if url.startswith("/"):
-            return url
-        return None
+            path = unquote(urlsplit(url).path)
+        elif url.startswith("/"):
+            path = url
+        else:
+            return None
+        return path if in_chosen_folder(path) else ""
 
     def original_if_cached(self, url):
         if not url:
             return None
         local = self._local_path(url)
-        if local:
-            return local if os.path.exists(local) else None
+        if local is not None:
+            return local if local and os.path.exists(local) else None
         path = self._original(url)
         return str(path) if path.exists() else None
 
@@ -210,6 +216,8 @@ class ImageCache:
         path = None
         try:
             source = self._local_path(url)
+            if source == "":
+                raise ValueError("a local picture outside the folders the user added")
             if source is None:
                 original = self._original(url)
                 if original.exists():

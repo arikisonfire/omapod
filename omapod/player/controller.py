@@ -15,6 +15,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 from gi.repository import GLib
 
+from ..config import chosen_folder
 from ..events import bus
 from ..feeds import chapters as chapter_utils
 from ..i18n import _
@@ -283,7 +284,7 @@ class PlayerController:
         episode = self.episode
         if episode.file_path:
             if os.path.exists(episode.file_path):
-                return episode.file_path
+                return os.path.abspath(episode.file_path)  # absolute: mpv never reads it as a protocol (av://…)
             # The file vanished: forget it and stream instead.
             self.library.db.update_episode(episode.id, file_path="", downloaded_at=0)
             episode.file_path, episode.downloaded_at = "", 0
@@ -311,8 +312,11 @@ class PlayerController:
         self.start_position = self.position
         url = self._source()
         if url is None:
-            self._fail(_("The episode's file is gone.") if episode.is_local
-                       else _("The episode's address is not a web address, so omaPOD does not open it."))
+            if episode.is_local and not chosen_folder(episode.feed_url):
+                self._fail(_("Choose this folder under Add podcast → Add local folder to use it on this computer."))
+            else:
+                self._fail(_("The episode's file is gone.") if episode.is_local
+                           else _("The episode's address is not a web address, so omaPOD does not open it."))
             return False
         options = {"start": f"{self.position / 1000:.3f}"}
         if episode.is_video:

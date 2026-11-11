@@ -71,7 +71,8 @@ if [ "$uninstall" = 1 ]; then
 fi
 
 missing=()
-python3 - <<'PY' || missing+=("python-gobject gtk4 libadwaita")
+# -P here and in the launcher: the current folder stays out of Python's module path (a gi.py there would run).
+python3 -P - <<'PY' || missing+=("python-gobject gtk4 libadwaita")
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
@@ -104,7 +105,7 @@ cat > "$BIN" <<SH
 #!/usr/bin/env bash
 export PYTHONPYCACHEPREFIX="\${XDG_CACHE_HOME:-\$HOME/.cache}/omapod/pycache"
 export PYTHONPATH=$(printf %q "$APP_DIR")\${PYTHONPATH:+:\$PYTHONPATH}
-exec python3 -m omapod "\$@"
+exec python3 -P -m omapod "\$@"
 SH
 chmod +x "$BIN"
 

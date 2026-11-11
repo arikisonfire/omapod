@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from ..config import owns_file
+from ..config import chosen_folder, owns_file, trust_folder, trusted_folders
 from ..events import bus
 from ..feeds import chapters as chapter_utils
 from ..feeds.parser import FeedParseError, NotAFeedError, parse_feed
@@ -209,6 +209,11 @@ class Library:
             url = "https://" + url[7:]
         if not re.match(r"^https?://", url, re.I) and not url.startswith(LOCAL_PREFIX):
             url = "https://" + url
+        # A login written into the address (https://user:password@host/feed) becomes the podcast's login. In the
+        # address it would go wherever the address goes: to the sync server, into exports and the download log.
+        url, user, secret = http.split_userinfo(url)
+        if user and not username:
+            username, password = user, secret
         existing = self.db.get_feed_by_url(url)
         if existing is not None:
             return existing.id
@@ -261,7 +266,9 @@ class Library:
             if self.downloads:
                 for episode in episodes:
                     self.downloads.cancel(episode.id)
-            if not feed.is_local:
+            if feed.is_local:
+                trust_folder(feed.local_path, False)  # a podcast of this folder later has to be chosen again
+            else:
                 for episode in episodes:
                     self._remove_file(episode)
                 folder = self.feed_folder(feed)
@@ -563,24 +570,45 @@ class Library:
     # ------------------------------------------------------------ local folders
 
     def add_local_folder(self, folder):
+        """A podcast of a folder the user chose (in a file dialog). Choosing it is what lets omaPOD read the folder
+        and move its files to the trash (config.trusted_folders), also for a podcast of that folder that came with
+        an imported library: it keeps its history and gets its files back."""
         folder = os.path.abspath(os.path.expanduser(folder))
         url = LOCAL_PREFIX + folder
+        trust_folder(folder)
         existing = self.db.get_feed_by_url(url)
         if existing is not None:
-            return existing.id
-        with self.db.tx() as conn:
-            feed_id = self.db.insert_feed(conn, {
-                "url": url, "title": os.path.basename(folder.rstrip("/")) or folder, "state": FEED_SUBSCRIBED,
-                "added": now_s(), "description": _("This virtual podcast was created by adding a folder to omaPOD."),
-                "auto_download": 0,
-            })
+            feed_id = existing.id
+            if existing.state == FEED_PREVIEW:
+                self.db.update_feed(feed_id, state=FEED_SUBSCRIBED, keep_updated=1)
+        else:
+            with self.db.tx() as conn:
+                feed_id = self.db.insert_feed(conn, {
+                    "url": url, "title": os.path.basename(folder.rstrip("/")) or folder, "state": FEED_SUBSCRIBED,
+                    "added": now_s(), "auto_download": 0,
+                    "description": _("This virtual podcast was created by adding a folder to omaPOD."),
+                })
         self.refresh_feed(feed_id)
         self._changed()
         return feed_id
 
+    def forget_unused_folders(self):
+        """Keeps the permission for chosen folders to those that are still podcasts in this library. A folder whose
+        podcast left it, also with a database import that replaced the library, has to be chosen again."""
+        folders = {feed.local_path for feed in self.db.get_feeds(states=(FEED_PREVIEW, FEED_SUBSCRIBED, FEED_ARCHIVED),
+                                                                 with_counts=False) if feed.is_local}
+        for folder in trusted_folders():
+            if folder not in folders:
+                trust_folder(folder, False)
+
     def _refresh_local(self, feed):
         folder = Path(feed.local_path)
         result = RefreshResult(feed.id)
+        if not chosen_folder(feed.url):
+            # From an imported library: its folder is read only once the user has chosen it on this computer.
+            result.error = _("Choose this folder under Add podcast → Add local folder to use it on this computer.")
+            self._refresh_failed(feed, result.error, str(folder))
+            return result
         if not folder.is_dir():
             result.error = _("The folder does not exist any more.")
             self._refresh_failed(feed, result.error, str(folder))
@@ -595,7 +623,13 @@ class Library:
             for path in files:
                 guid = str(path.relative_to(folder))
                 listed.add(guid)
-                if guid in rows:
+                row = rows.get(guid)
+                if row is not None:
+                    # The folder says where an episode's file is, not the database: an import forgets the files of
+                    # folders, and a library from elsewhere can name any.
+                    if row["file_path"] != str(path) or row["media_url"] != path.as_uri() or not row["downloaded_at"]:
+                        self.db.update_episode(row["id"], conn=conn, file_path=str(path), media_url=path.as_uri(),
+                                               downloaded_at=int(path.stat().st_mtime) or now_s())
                     continue
                 stat = path.stat()
                 episode_id = self.db.insert_episode(conn, {
@@ -610,7 +644,7 @@ class Library:
                 placeholders = ",".join("?" * len(gone))
                 conn.execute(f"DELETE FROM episodes WHERE id IN ({placeholders})", gone)
             self.db.update_feed(feed.id, conn=conn, last_refresh=now_s(), refresh_error="",
-                                image_url=cover.as_uri() if cover else feed.image_url)
+                                image_url=cover.as_uri() if cover else "")
         if result.new_ids:
             self._changed(result.new_ids)
         return result
@@ -644,10 +678,12 @@ class Library:
         self._changed(feeds=True)
 
     def edit_feed_url(self, feed_id, new_url):
+        new_url, user, secret = http.split_userinfo(new_url or "")  # a login in the address: see preview
         feed = self.db.get_feed(feed_id)
         if feed is None or not new_url or self.db.get_feed_by_url(new_url):
             return False
-        self.db.update_feed(feed_id, url=new_url, etag="", last_modified="")
+        login = {"username": user, "password": secret} if user else {}
+        self.db.update_feed(feed_id, url=new_url, etag="", last_modified="", **login)
         if feed.state == FEED_SUBSCRIBED:
             self.sync_feed(feed.url, False)
             self.sync_feed(new_url, True)
@@ -1192,6 +1228,12 @@ class Library:
             target_folder = new_dir / source.parent.name
             target_folder.mkdir(parents=True, exist_ok=True)
             target = target_folder / source.name
+            if target == source:
+                continue  # the same folder
+            counter = 2
+            while os.path.lexists(target):  # the new folder may hold a file of that name: never replace it
+                target = target_folder / f"{source.stem} ({counter}){source.suffix}"
+                counter += 1
             try:
                 shutil.move(str(source), str(target))
                 self.db.update_episode(episode.id, file_path=str(target))

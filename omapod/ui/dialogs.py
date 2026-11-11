@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import os
+from urllib.parse import urlsplit
 
 from gi.repository import Adw, Gio, GLib, Gtk
 
@@ -127,8 +128,11 @@ class FeedSettingsDialog(Adw.PreferencesDialog):
         page.add(downloads)
 
         if not feed.is_local:
-            auth = Adw.PreferencesGroup(title=_("Authentication"),
-                                        description=_("For podcasts that need a username and password"))
+            plain = urlsplit(feed.url).scheme.lower() == "http"
+            auth = Adw.PreferencesGroup(title=_("Authentication"), description=_(
+                "This podcast's address is not encrypted (http): its username and password travel in plain text, "
+                "and others on the network can read them.") if plain
+                else _("For podcasts that need a username and password"))
             user = Adw.EntryRow(title=_("Username"), text=feed.username)
             password = Adw.PasswordEntryRow(title=_("Password"), text=feed.password)
             for row in (user, password):
@@ -248,9 +252,14 @@ def text_prompt(parent, heading, value, confirm_label, callback, body="", reset_
     dialog.present(parent)
 
 
-def ask_credentials(parent, what, callback, username=""):
-    dialog = Adw.AlertDialog(heading=_("Authentication required"),
-                             body=_("“{what}” needs a username and password.").format(what=what))
+def ask_credentials(parent, what, callback, username="", plain=False):
+    """plain: the address that asks is http://, so the password would travel unencrypted. The dialog says so, as
+    the sync login does, and logging in looks like the risk it is."""
+    body = _("“{what}” needs a username and password.").format(what=what)
+    if plain:
+        body += "\n\n" + _("The connection to it is not encrypted (http): the password travels in plain text, and "
+                           "others on the network can read it.")
+    dialog = Adw.AlertDialog(heading=_("Authentication required"), body=body)
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     user = Gtk.Entry(placeholder_text=_("Username"), text=username or "")
     password = Gtk.PasswordEntry(placeholder_text=_("Password"), show_peek_icon=True, activates_default=True)
@@ -259,7 +268,8 @@ def ask_credentials(parent, what, callback, username=""):
     dialog.set_extra_child(box)
     dialog.add_response("cancel", _("Cancel"))
     dialog.add_response("ok", _("Log in"))
-    dialog.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+    dialog.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE if plain
+                                   else Adw.ResponseAppearance.SUGGESTED)
     dialog.set_default_response("ok")
 
     def on_response(_dialog, response):
@@ -268,6 +278,7 @@ def ask_credentials(parent, what, callback, username=""):
 
     dialog.connect("response", on_response)
     dialog.present(parent)
+    return dialog
 
 
 def choose_feed(parent, candidates, callback):

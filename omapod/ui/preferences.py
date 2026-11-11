@@ -11,9 +11,10 @@ from pathlib import Path
 from gi.repository import Adw, Gio, GLib, Gtk
 
 from .. import APP_NAME
-from ..config import DEFAULTS, owns_file, paths, private_file
+from ..config import DEFAULTS, own_downloads_dir, owns_file, paths, private_file
 from ..db import SCHEMA_VERSION
 from ..i18n import _, ngettext
+from ..models import LOCAL_PREFIX
 from ..sync.providers import (GpodderNet, NextcloudLoginFlow, PlainHttpOnly, SyncError, UntrustedCertificate, host_of,
                               normalize_host)
 from ..sync.service import default_device_id
@@ -90,21 +91,32 @@ def check_import(path):
     return None
 
 
-def prepare_import(path):
+def prepare_import(path, known=()):
     """Readies omaPOD's own copy of a database chosen for import, in place, before it replaces the library: it is
-    checked again (the chosen file could have changed since), and downloads naming a file omaPOD may not touch
-    (config.owns_file: outside the download folder, or outside the folder a podcast was made from) are forgotten,
-    so that deleting them later cannot reach the user's other files. Returns a problem text, or None."""
+    checked again (the chosen file could have changed since), and downloads naming a file omaPOD may not touch are
+    forgotten, so that deleting them later cannot reach the user's other files (config.owns_file): a file outside
+    the download folder, or, for a podcast of a folder, a file outside a folder the user chose on this computer.
+    omaPOD's own download folder holds nothing but its downloads; one the user chose may hold other files as well,
+    so there the import keeps only `known`, the files of the downloads the current library has.
+    Returns a problem text, or None."""
     problem = check_import(path)
     if problem:
         return problem
+    own_folder = own_downloads_dir()
+    known = set(known)
+
+    def kept(file_path, url):
+        if not owns_file(file_path, url):
+            return False
+        return own_folder or file_path in known or (isinstance(url, str) and url.startswith(LOCAL_PREFIX))
+
     try:
         conn = sqlite3.connect(path)
         try:
             conn.execute("PRAGMA trusted_schema = OFF")
             rows = conn.execute("SELECT e.id, e.file_path, f.url FROM episodes e LEFT JOIN feeds f ON f.id = e.feed_id "
                                 "WHERE e.file_path IS NOT NULL AND e.file_path != ''").fetchall()
-            foreign = [(episode_id,) for episode_id, file_path, url in rows if not owns_file(file_path, url)]
+            foreign = [(episode_id,) for episode_id, file_path, url in rows if not kept(file_path, url)]
             conn.executemany("UPDATE episodes SET file_path = '', downloaded_at = 0 WHERE id = ?", foreign)
             conn.commit()
         finally:
@@ -855,10 +867,11 @@ class Preferences(Adw.PreferencesDialog):
             def on_response(_d, response):
                 if response != "ok":
                     return
+                known = {episode.file_path for episode in self.app.db.get_episodes(("downloaded",))}
                 try:
                     with private_file(pending_import_path()) as copy:
                         shutil.copyfile(path, copy)
-                        problem = prepare_import(copy)
+                        problem = prepare_import(copy, known)
                         if problem:
                             raise ValueError(problem)
                 except (OSError, ValueError) as error:
