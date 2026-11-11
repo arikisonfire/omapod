@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.arikisonfire.pod",
   "name": "omaPOD",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "author": "arikisonfire",
   "license": "GPL-3.0-or-later",
   "description": "A podcast app for Omarchy, modelled on AntennaPod: a window that tiles and follows your theme, with inbox, queue, downloads, chapters, statistics and backups, plus a bar widget for playback, speed and sleep timer. Picks up where AntennaPod on your phone stopped, through Nextcloud or gpodder.net.",
