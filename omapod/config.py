@@ -6,6 +6,7 @@ Secrets (the sync login, the proxy password, the Podcast Index key) are kept
 in a separate file with mode 0600.
 """
 
+import contextlib
 import copy
 import json
 import os
@@ -447,3 +448,52 @@ def instance_lock(role, stop_refresh=False):
 def downloads_dir():
     custom = settings().get("downloads_dir")
     return Path(custom).expanduser() if custom else paths.default_downloads
+
+
+def in_folder(path, folder):
+    """Whether the file `path` lies somewhere in `folder`, judged by the folder it is in, with symbolic links
+    resolved. The file itself may be a link: deleting, moving or trashing it affects only the link."""
+    if not isinstance(path, str) or not path or not folder or os.path.basename(path) in ("", ".", ".."):
+        return False
+    parent = os.path.realpath(os.path.dirname(os.path.abspath(path)))
+    root = os.path.realpath(folder)
+    return parent == root or parent.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def is_download(path):
+    """Whether omaPOD may delete or move `path` as one of its downloads: a file in a podcast's folder in the
+    download folder (<download folder>/<podcast>/<file>, where DownloadManager saves them). The database names
+    the files, and an imported backup could name any file of the user."""
+    if not in_folder(path, downloads_dir()) or os.path.isdir(path):
+        return False
+    parent = os.path.realpath(os.path.dirname(os.path.abspath(path)))
+    return os.path.dirname(parent) == os.path.realpath(downloads_dir())
+
+
+def owns_file(path, feed_url):
+    """Whether the file an episode names is one omaPOD may delete, move or trash: a download in the download
+    folder, or for a podcast made from an added folder (feed address local:<folder>), a file in that folder."""
+    from .models import LOCAL_PREFIX
+
+    if isinstance(feed_url, str) and feed_url.startswith(LOCAL_PREFIX):
+        return in_folder(path, feed_url[len(LOCAL_PREFIX):])
+    return is_download(path)
+
+
+@contextlib.contextmanager
+def private_file(path):
+    """For a file the user exports: a new file that only the owner can read from the start (mkstemp creates it
+    with 0600) and that replaces `path` once it is complete. Yields its path. Nobody else can open it while it is
+    written, and whoever had an old file at `path` open keeps only the old content."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".omapod-", suffix=".tmp")
+    os.close(fd)
+    try:
+        yield tmp
+        os.replace(tmp, path)
+    except BaseException:
+        for leftover in (tmp, tmp + "-journal"):
+            try:
+                os.unlink(leftover)
+            except OSError:
+                pass
+        raise

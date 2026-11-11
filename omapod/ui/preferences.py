@@ -1,16 +1,18 @@
 """Settings, laid out like AntennaPod's preference screens, plus sync setup,
 backup/restore and the keyboard shortcuts dialog."""
 
+import re
 import shutil
 import sqlite3
 import threading
 import time
+from pathlib import Path
 
 from gi.repository import Adw, Gio, GLib, Gtk
 
 from .. import APP_NAME
-from ..config import DEFAULTS, paths
-from ..db import SCHEMA_VERSION, make_private
+from ..config import DEFAULTS, owns_file, paths, private_file
+from ..db import SCHEMA_VERSION
 from ..i18n import _, ngettext
 from ..sync.providers import (GpodderNet, NextcloudLoginFlow, PlainHttpOnly, SyncError, UntrustedCertificate, host_of,
                               normalize_host)
@@ -39,13 +41,20 @@ PAGES = [("home", _("Home")), ("queue", _("Queue")), ("inbox", _("Inbox")), ("ep
 
 
 def export_database(app, target):
-    source = app.db.conn()
-    destination = sqlite3.connect(target)
-    try:
-        source.backup(destination)
-    finally:
-        destination.close()
-    make_private(target)
+    """A copy of the library. It holds the passwords of protected podcasts, so it is private from its first byte
+    (config.private_file): SQLite would create it readable for everyone under the usual umask 022."""
+    with private_file(target) as path:
+        destination = sqlite3.connect(path)
+        try:
+            app.db.conn().backup(destination)
+        finally:
+            destination.close()
+
+
+def write_export(target, text):
+    """OPML and HTML exports: private like the database export, as feed addresses can carry access tokens."""
+    with private_file(target) as path, open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
 
 
 def pending_import_path():
@@ -53,17 +62,55 @@ def pending_import_path():
 
 
 def check_import(path):
+    """None if `path` holds an omaPOD database that can be imported, otherwise why not. The file may come from
+    anyone, so it is read with SQLite's precautions for untrusted files, must pass the integrity check and may
+    hold only tables and indexes: no triggers, views or virtual tables, which would run their own SQL whenever
+    omaPOD changes its database."""
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        conn.close()
+        conn = sqlite3.connect(Path(path).absolute().as_uri() + "?mode=ro", uri=True)
+        try:
+            for pragma in ("trusted_schema = OFF", "cell_size_check = ON", "mmap_size = 0"):
+                conn.execute(f"PRAGMA {pragma}")
+            objects = conn.execute("SELECT type, name, sql FROM sqlite_master").fetchall()
+            damage = conn.execute("PRAGMA integrity_check(1)").fetchone()[0]
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            conn.close()
     except sqlite3.Error as error:
         return _("This file is not an omaPOD database ({error}).").format(error=error)
-    if not {"feeds", "episodes", "queue"} <= tables:
+    tables = {name for kind, name, _sql in objects if kind == "table"}
+    extra = [name for kind, name, sql in objects
+             if kind not in ("table", "index") or re.match(r"\s*CREATE\s+VIRTUAL\b", sql or "", re.I)]
+    if not {"feeds", "episodes", "queue"} <= tables or extra:
         return _("This file is not an omaPOD database.")
+    if damage != "ok":
+        return _("This file is not an omaPOD database ({error}).").format(error=" ".join(str(damage).split()))
     if version > SCHEMA_VERSION:
         return _("This database was exported with a newer version of omaPOD. Update omaPOD first.")
+    return None
+
+
+def prepare_import(path):
+    """Readies omaPOD's own copy of a database chosen for import, in place, before it replaces the library: it is
+    checked again (the chosen file could have changed since), and downloads naming a file omaPOD may not touch
+    (config.owns_file: outside the download folder, or outside the folder a podcast was made from) are forgotten,
+    so that deleting them later cannot reach the user's other files. Returns a problem text, or None."""
+    problem = check_import(path)
+    if problem:
+        return problem
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA trusted_schema = OFF")
+            rows = conn.execute("SELECT e.id, e.file_path, f.url FROM episodes e LEFT JOIN feeds f ON f.id = e.feed_id "
+                                "WHERE e.file_path IS NOT NULL AND e.file_path != ''").fetchall()
+            foreign = [(episode_id,) for episode_id, file_path, url in rows if not owns_file(file_path, url)]
+            conn.executemany("UPDATE episodes SET file_path = '', downloaded_at = 0 WHERE id = ?", foreign)
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error as error:
+        return _("This file is not an omaPOD database ({error}).").format(error=error)
     return None
 
 
@@ -806,9 +853,18 @@ class Preferences(Adw.PreferencesDialog):
             confirm.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
 
             def on_response(_d, response):
-                if response == "ok":
-                    shutil.copy2(path, pending_import_path())
-                    restart_app(self.app)
+                if response != "ok":
+                    return
+                try:
+                    with private_file(pending_import_path()) as copy:
+                        shutil.copyfile(path, copy)
+                        problem = prepare_import(copy)
+                        if problem:
+                            raise ValueError(problem)
+                except (OSError, ValueError) as error:
+                    self.toast(str(error), 6)
+                    return
+                restart_app(self.app)
 
             confirm.connect("response", on_response)
             confirm.present(self)
@@ -820,11 +876,8 @@ class Preferences(Adw.PreferencesDialog):
 
         feeds = [f for f in self.app.db.get_feeds(with_counts=False) if not f.is_local]
 
-        def write(path):
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(build_opml(feeds))
-
-        self._save_dialog(_("OPML export"), "omapod-subscriptions.opml", write)
+        self._save_dialog(_("OPML export"), "omapod-subscriptions.opml",
+                          lambda path: write_export(path, build_opml(feeds)))
 
     def _import_opml(self):
         page = self.app._page("add")
@@ -836,11 +889,8 @@ class Preferences(Adw.PreferencesDialog):
 
         feeds = [f for f in self.app.db.get_feeds(with_counts=False) if not f.is_local]
 
-        def write(path):
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(build_html_export(feeds))
-
-        self._save_dialog(_("HTML export"), "omapod-subscriptions.html", write)
+        self._save_dialog(_("HTML export"), "omapod-subscriptions.html",
+                          lambda path: write_export(path, build_html_export(feeds)))
 
     def _export_favorites(self):
         import html
@@ -854,11 +904,10 @@ class Preferences(Adw.PreferencesDialog):
 
         def write(path):
             items = "".join(f'<li>{link(e)} <span>{html.escape(e.feed_title)}</span></li>' for e in episodes)
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write("<!doctype html><html><head><meta charset=\"utf-8\"><title>Favorites</title>"
-                             "<style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;"
-                             "padding:0 16px}li{margin:8px 0}span{color:#666}</style></head><body>"
-                             f"<h1>Favorite episodes</h1><ul>{items}</ul></body></html>\n")
+            write_export(path, "<!doctype html><html><head><meta charset=\"utf-8\"><title>Favorites</title>"
+                               "<style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;"
+                               "padding:0 16px}li{margin:8px 0}span{color:#666}</style></head><body>"
+                               f"<h1>Favorite episodes</h1><ul>{items}</ul></body></html>\n")
 
         self._save_dialog(_("Favorites export"), "omapod-favorites.html", write)
 

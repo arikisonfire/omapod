@@ -47,8 +47,13 @@ class Mpv:
             os.unlink(self.socket_path)
         except FileNotFoundError:
             pass
+        # --tls-verify: mpv does not check certificates by default, and a stream of a protected podcast carries
+        # its password, which ffmpeg hands to whoever answers 401. With it, ffmpeg checks the certificate and the
+        # host name against the system's certificate authorities before anything is sent, on redirects, retries
+        # and HLS segments too, like the rest of omaPOD.
         args = [
             "mpv", "--idle=yes", "--no-config", "--no-terminal", f"--input-ipc-server={self.socket_path}",
+            "--tls-verify=yes",
             "--audio-display=no", "--vid=no", "--force-window=no", "--keep-open=no", "--ytdl=no",
             "--cache=yes", "--demuxer-max-bytes=64MiB", "--demuxer-readahead-secs=60",
             "--audio-client-name=omaPOD", f"--user-agent={USER_AGENT}", f"--volume={int(volume)}",

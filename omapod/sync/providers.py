@@ -8,7 +8,7 @@ import re
 import socket
 import time
 from dataclasses import dataclass, field
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 from ..i18n import _
 from ..net import http
@@ -395,7 +395,7 @@ class NextcloudLoginFlow:
         # The login page is opened in the browser: never hand other schemes to the desktop.
         if not all(isinstance(u, str) and u.startswith(("https://", "http://")) for u in (login, endpoint)):
             raise SyncError(_not_nextcloud())
-        self.login_url, self.token, self.endpoint = login, str(token), endpoint
+        self.login_url, self.token, self.endpoint = on_server(server, login), str(token), on_server(server, endpoint)
         return self.login_url
 
     def _untrusted(self, error):
@@ -407,8 +407,9 @@ class NextcloudLoginFlow:
 
     def poll(self):
         """Returns (server, login_name, app_password) once granted, None while waiting. The server is the one
-        Nextcloud names, but never with http:// when the login ran over https (behind a proxy, Nextcloud often
-        does not know it is reached with https)."""
+        Nextcloud names if the app password may go there (auth_allowed: the same origin as the login, or its https
+        upgrade), otherwise the one the login ran on: behind a proxy, Nextcloud often does not know it is reached
+        with https, or under which name."""
         try:
             response = http.request(self.endpoint, method="POST", data=urlencode({"token": self.token}).encode(),
                                     headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=30,
@@ -423,9 +424,23 @@ class NextcloudLoginFlow:
             login, password = data["loginName"], data["appPassword"]
         except (ValueError, KeyError, TypeError):
             raise SyncError(_not_nextcloud()) from None
-        if self.server.startswith("https://") and not server.startswith("https://"):
-            server = self.server
+        if not http.auth_allowed(self.server, server):
+            server = self.server  # the app password goes where the login went (see on_server)
         return server, login, password
+
+
+def on_server(server, url):
+    """An address the Login Flow names (login page, poll endpoint), on the server the login started on.
+
+    The poll token is all it takes to collect the app password once the user grants access, so it goes only
+    where the login went: the server the user entered, over https, or over http only after asking
+    (PlainHttpOnly). Behind a proxy that ends TLS, Nextcloud often names its addresses with http://, its inner
+    port or another host name; then the address keeps its path but moves to the login's own origin. The https
+    upgrade of the same server (auth_allowed) stays as Nextcloud names it."""
+    if http.auth_allowed(server, url):
+        return url
+    own, named = urlsplit(server), urlsplit(url)
+    return urlunsplit((own.scheme, own.netloc, named.path, named.query, ""))
 
 
 def _not_nextcloud():

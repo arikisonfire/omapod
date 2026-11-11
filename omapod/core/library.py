@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from ..config import owns_file
 from ..events import bus
 from ..feeds import chapters as chapter_utils
 from ..feeds.parser import FeedParseError, NotAFeedError, parse_feed
@@ -951,13 +952,20 @@ class Library:
             bus.emit("download-error", episode, reason)
 
     def _remove_file(self, episode):
-        if episode.file_path and not episode.is_local:
-            try:
-                os.unlink(episode.file_path)
-            except FileNotFoundError:
-                pass
-            except OSError as error:
-                bus.emit("message", str(error), "error")
+        """Deletes the file of a download, but only a file in the download folder (config.is_download): the
+        database names it, and an imported backup could name any of the user's files. Returns False when such a
+        file stays where it is."""
+        if not episode.file_path or episode.is_local:
+            return True
+        if not owns_file(episode.file_path, episode.feed_url):
+            return not os.path.lexists(episode.file_path)
+        try:
+            os.unlink(episode.file_path)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            bus.emit("message", str(error), "error")
+        return True
 
     def delete_downloads(self, ids, quiet=False, stop_player=True, local_files=False):
         """Delete downloaded files. Files in local folders are the user's own: they go to the trash, and only
@@ -965,7 +973,7 @@ class Library:
         allow_local = local_files or (quiet and bool(self.settings.get("auto_delete_local")))
         episodes = [e for e in self.db.get_episodes_by_ids(ids) if e.is_downloaded and (allow_local or not e.is_local)]
         current = self.current_episode_id()
-        deleted = []
+        deleted, kept = [], []
         for episode in episodes:
             if episode.id == current and self.player and stop_player:
                 self.player.stop()
@@ -974,10 +982,16 @@ class Library:
                     continue
                 self.db.execute("DELETE FROM episodes WHERE id = ?", (episode.id,))
             else:
-                self._remove_file(episode)
+                if not self._remove_file(episode):
+                    kept.append(episode.file_path)
                 self.db.update_episode(episode.id, file_path="", downloaded_at=0)
                 self.sync_action(episode, "delete")
             deleted.append(episode.id)
+        if kept and not quiet:
+            bus.emit("message", ngettext(
+                "{file} is not in the download folder, so omaPOD left it where it is.",
+                "{n} files are not in the download folder, so omaPOD left them where they are.",
+                len(kept)).format(file=os.path.basename(kept[0]), n=len(kept)), "info")
         if not deleted:
             return 0
         if self.settings.get("delete_removes_from_queue"):
@@ -991,6 +1005,9 @@ class Library:
         return len(deleted)
 
     def _trash_local(self, episode):
+        """Moves a file of an added folder to the trash; one outside that folder stays (config.owns_file)."""
+        if not owns_file(episode.file_path, episode.feed_url):
+            return True
         try:
             if os.path.lexists(episode.file_path):
                 move_to_trash(episode.file_path)
@@ -1169,8 +1186,8 @@ class Library:
         new_dir.mkdir(parents=True, exist_ok=True)
         moved = 0
         for episode in self.db.get_episodes(("downloaded",)):
-            if episode.is_local or not episode.file_path:
-                continue
+            if episode.is_local or not owns_file(episode.file_path, episode.feed_url):
+                continue  # files elsewhere are not omaPOD's to move (see _remove_file)
             source = Path(episode.file_path)
             target_folder = new_dir / source.parent.name
             target_folder.mkdir(parents=True, exist_ok=True)

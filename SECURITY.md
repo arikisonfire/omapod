@@ -26,7 +26,14 @@ files that hold personal data or secrets with mode 0600.
 | Player state for the bar widget, control socket, lock file | `$XDG_RUNTIME_DIR/omapod/` |
 
 Database exports and backups contain the passwords of protected podcasts, so a restored library keeps working.
-Keep them as private as the passwords themselves.
+Keep them as private as the passwords themselves. omaPOD creates every export (database, OPML, HTML) readable
+by your user only (0600) before it writes the first byte, and puts it in place once it is complete.
+
+**Importing a database** replaces the library with a file that may come from anywhere. omaPOD reads it with
+SQLite's precautions for untrusted files and accepts it only if it passes the integrity check and holds nothing
+but tables and indexes (no triggers, views or virtual tables). Downloads it lists that are not in your download
+folder (or, for a local folder, not in that folder) are forgotten, so the import cannot point omaPOD at your
+other files.
 
 ## Network connections
 
@@ -47,6 +54,9 @@ system's proxy settings instead.
 
 ## How credentials are protected
 
+- **TLS:** every https connection checks the server's certificate and host name against your system's
+  certificate authorities: feeds, downloads, images, sync (or the one certificate you confirmed for it, see
+  below), and playback, where mpv runs with `--tls-verify=yes` (mpv's own default is not to check).
 - **Protected podcasts:** the username and password go only to the feed's own server (same scheme, host and
   port, or its https upgrade): for the feed, its older pages, downloads and streams. No other server receives
   them, not even one that asks for them (HTTP 401); a download from such a server fails with a message that
@@ -59,6 +69,10 @@ system's proxy settings instead.
   https and never falls back to plain http on its own: it offers http only for addresses in your local network
   or VPN, after asking. Every login over http, also one you typed with `http://`, shows a lasting warning in the
   sync settings.
+- **Nextcloud login:** the login page, the login token and the app password stay with the server you entered,
+  over the connection you chose (https, or http after asking). Behind some proxies Nextcloud names other
+  addresses for them (`http://`, another port or host name); omaPOD then keeps their path but uses the server
+  you entered.
 
 ## Other programs on your desktop
 
@@ -76,9 +90,14 @@ system's proxy settings instead.
 
 ## Your files
 
+omaPOD deletes and moves only its own downloads: files in a podcast's folder inside the download folder
+(`<download folder>/<podcast>/<file>`). If an episode names a file anywhere else, deleting the download only
+makes omaPOD forget it; the file stays where it is.
+
 Episodes of a local folder you added are your own files. omaPOD never deletes them on its own: **Delete
 download** asks first and moves them to the trash, **Delete played downloads** leaves them alone, and automatic
 deletion skips them unless you switch on **Auto delete from local folders** (then they go to the trash too).
+Only files inside that folder go to the trash.
 
 ## Limits by design
 

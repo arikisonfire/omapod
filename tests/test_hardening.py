@@ -61,6 +61,7 @@ class Host:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(*tls)
             self.httpd.socket = context.wrap_socket(self.httpd.socket, server_side=True)
+            self.httpd.handle_error = lambda *_args: None  # clients that reject the certificate hang up
             scheme = "https"
         self.port = self.httpd.server_address[1]
         self.base = f"{scheme}://{name}:{self.port}"
@@ -367,6 +368,68 @@ class CredentialsStayWithTheirHost(Servers):
         self.assertEqual(dialogs, [moved])
 
 
+class StreamCertificates(Servers):
+    """Marketplace review of 0.1.1: mpv checks no certificates unless told to, so whoever intercepts a stream of a
+    protected podcast with a certificate of its own could answer 401 and receive the password."""
+
+    def setUp(self):
+        super().setUp()
+        if not shutil.which("mpv"):
+            self.skipTest("mpv not installed")
+        from omapod.events import bus
+        from tests.fakeserver import self_signed_certificate
+
+        bus.attach_main_loop()
+        self.tls = self_signed_certificate(self.tmp, "DNS:localhost,IP:127.0.0.1")
+        if self.tls is None:
+            self.skipTest("openssl is not installed")
+
+    def play(self, mpv_class=None):
+        """Streams an episode of a protected podcast from a server with a certificate the system does not trust.
+        Returns the player's error and the credentials the server received."""
+        from omapod import config
+        from omapod.models import FEED_SUBSCRIBED
+        from omapod.player import controller
+        from tests.test_player import run_until
+
+        podcast = self.host(tls=self.tls)
+        podcast.routes["/own.mp3"] = (200, {"Content-Type": "audio/mpeg"}, (FIX / "tone.mp3").read_bytes())
+        podcast.private.add("/own.mp3")
+        with self.db.tx() as conn:
+            feed_id = self.db.insert_feed(conn, {"url": podcast.base + "/feed.xml", "title": "Private",
+                                                 "state": FEED_SUBSCRIBED, "username": "user", "password": "pass"})
+            episode_id = self.db.insert_episode(conn, {"feed_id": feed_id, "guid": "own", "title": "own",
+                                                       "media_url": podcast.base + "/own.mp3",
+                                                       "media_type": "audio/mpeg"})
+        with mock.patch.object(controller, "Mpv", mpv_class or controller.Mpv):
+            player = controller.PlayerController(self.library, self.settings, config.paths)
+            self.library.player = player
+            try:
+                self.assertTrue(player.play_episode(episode_id, checked=True))
+                run_until(lambda: player.error or (player.status == "playing" and player.position > 500))
+            finally:
+                player.shutdown()  # before tearDown closes the database
+        return player.error, podcast.credentials()
+
+    def test_a_server_the_system_does_not_trust_gets_nothing(self):
+        error, credentials = self.play()
+        self.assertTrue(error)
+        self.assertEqual(credentials, [])  # not even a request, so no 401 could ask for the password
+
+    def test_a_trusted_server_gets_the_stream_with_the_password(self):
+        from omapod.player.mpv import Mpv
+
+        authority = str(self.tls[0])
+
+        class Trusting(Mpv):  # as if the system trusted the server's certificate
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, extra_args=[f"--tls-ca-file={authority}"], **kwargs)
+
+        error, credentials = self.play(Trusting)
+        self.assertEqual(error, "")
+        self.assertIn(AUTH, credentials)
+
+
 class TunnelProxy:
     """An HTTP proxy that only tunnels (CONNECT), as https requests use one; records what it was asked."""
 
@@ -442,6 +505,52 @@ class CertificateTrust(Servers):
         with mock.patch.object(providers, "is_private_host", lambda host: host == "nas.lan"):
             self.assertTrue(providers.UntrustedCertificate("https://nas.lan", {}).private)
             self.assertFalse(providers.UntrustedCertificate("https://cloud.example", {}).private)
+
+
+class NextcloudLoginAddresses(Servers):
+    """Marketplace review of 0.1.1: behind a proxy that ends TLS, Nextcloud names http:// addresses in the Login
+    Flow, and the poll token, all it takes to collect the app password, went there in plain text although the
+    login ran over https."""
+
+    def test_addresses_keep_their_path_on_the_login_origin(self):
+        from omapod.sync.providers import on_server
+
+        for server, named, expected in (
+                ("https://cloud.example", "http://cloud.example/login/v2/poll", "https://cloud.example/login/v2/poll"),
+                ("https://cloud.example/nc", "http://cloud.example:8080/nc/index.php/login/v2/poll?x=1",
+                 "https://cloud.example/nc/index.php/login/v2/poll?x=1"),  # the proxy's inner port
+                ("https://192.168.1.5", "https://cloud.home.lan/login/v2/flow/abc",
+                 "https://192.168.1.5/login/v2/flow/abc"),  # another name for the server
+                ("https://cloud.example:8443", "https://u:p@cloud.example/login/v2/poll#x",
+                 "https://cloud.example:8443/login/v2/poll"),
+                ("https://cloud.example", "https://cloud.example/login/v2/poll", "https://cloud.example/login/v2/poll"),
+                ("http://cloud.example", "https://cloud.example/login/v2/poll",
+                 "https://cloud.example/login/v2/poll")):  # an https upgrade stays
+            self.assertEqual(on_server(server, named), expected, named)
+
+    def test_token_and_app_password_stay_with_the_server_the_login_ran_on(self):
+        from omapod.net import http
+        from omapod.sync.providers import NextcloudLoginFlow
+        from tests.fakeserver import FakeServer, self_signed_certificate
+
+        tls = self_signed_certificate(self.tmp, "DNS:localhost,IP:127.0.0.1")
+        if tls is None:
+            self.skipTest("openssl is not installed")
+        pin = http.certificate_sha256(ssl.PEM_cert_to_DER_cert(Path(tls[0]).read_text()))
+        with FakeServer(str(FIX / "tone.mp3"), tls=tls) as cloud, FakeServer(str(FIX / "tone.mp3")) as plain:
+            port = cloud.base.rsplit(":", 1)[1]
+            for named in (plain.base,  # http:// and the proxy's inner port
+                          f"http://127.0.0.1:{port}",  # http:// on the server's own port
+                          f"https://localhost:{port}"):  # another name for the server
+                with self.subTest(named=named):
+                    cloud.sync.login_base = cloud.sync.login_server = named
+                    cloud.sync.login_polls = 0
+                    flow = NextcloudLoginFlow(cloud.base, pin)
+                    self.assertEqual(flow.start(), cloud.base + "/login/v2/flow/abc")
+                    self.assertIsNone(flow.poll())
+                    self.assertEqual(flow.poll(), (cloud.base, "user", "pass"))
+            self.assertEqual(plain.httpd.requests, [])
+            self.assertEqual(cloud.httpd.requests.count(("POST", "/login/v2/poll")), 6)
 
 
 class SizeLimits(Servers):
@@ -914,6 +1023,132 @@ class DatabaseImport(unittest.TestCase):
         self.assertEqual(Path(backup).stat().st_mode & 0o777, 0o600)
 
 
+class ImportedBackups(Servers):
+    """Marketplace review of 0.1.1: the database names the files of downloads, and an imported backup can name any
+    file of the user. omaPOD deletes and moves only files in its download folder, and an import forgets the rest."""
+
+    def setUp(self):
+        super().setUp()
+        from omapod import config
+
+        config._settings = self.settings  # one settings object, as in the app (downloads_dir reads it)
+        self.documents = Path(self.tmp) / "home" / "Documents"
+        self.documents.mkdir(parents=True)
+        self.victim = self.documents / "thesis.pdf"
+        self.victim.write_bytes(b"years of work")
+        self.feeds = 0
+
+    def downloaded(self, path, **episode):
+        """An unplayed episode of an https podcast (auto delete on) that claims `path` as its download."""
+        from omapod.models import FEED_SUBSCRIBED, UNPLAYED
+
+        self.feeds += 1
+        with self.db.tx() as conn:
+            feed_id = self.db.insert_feed(conn, {"url": f"https://p{self.feeds}.example/feed.xml", "title": "Imported",
+                                                 "state": FEED_SUBSCRIBED, "auto_delete": 1})
+            episode_id = self.db.insert_episode(conn, {"feed_id": feed_id, "guid": "g", "title": "Episode",
+                                                       "media_url": f"https://p{self.feeds}.example/1.mp3",
+                                                       "file_path": str(path), "downloaded_at": 1, "state": UNPLAYED,
+                                                       **episode})
+        return feed_id, episode_id
+
+    def test_files_outside_the_download_folder_stay_whatever_removes_a_download(self):
+        from omapod.config import downloads_dir
+        from omapod.events import bus
+
+        messages = []
+        self.addCleanup(bus.unsubscribe, bus.subscribe("message", lambda text, kind: messages.append(text)))
+        # A podcast folder in the download folder that is a link to the documents.
+        downloads_dir().mkdir(parents=True, exist_ok=True)
+        (downloads_dir() / "Linked").symlink_to(self.documents)
+        self.settings.update({"episode_cache": 1, "episode_cleanup": -3})
+        for name, path, remove in (
+                ("mark all as played", self.victim, lambda feed, episode: self.library.mark_feed_played(feed)),
+                ("delete download", self.victim, lambda feed, episode: self.library.delete_downloads([episode])),
+                ("remove podcast", self.victim, lambda feed, episode: self.library.unsubscribe([feed])),
+                ("episode cleanup", self.victim, lambda feed, episode: self.library.cleanup(1)),
+                ("linked folder", downloads_dir() / "Linked" / "thesis.pdf",
+                 lambda feed, episode: self.library.delete_downloads([episode]))):
+            with self.subTest(name):
+                feed_id, episode_id = self.downloaded(path)
+                remove(feed_id, episode_id)
+                self.assertEqual(self.victim.read_bytes(), b"years of work")
+                episode = self.db.get_episode(episode_id)
+                self.assertTrue(episode is None or not episode.is_downloaded)  # forgotten, though
+        self.assertIn("thesis.pdf is not in the download folder, so omaPOD left it where it is.", messages)
+        # Changing the download folder moves only downloads.
+        _feed, episode_id = self.downloaded(self.victim)
+        self.library.move_downloads(str(Path(self.tmp) / "new-downloads"))
+        self.assertEqual(self.victim.read_bytes(), b"years of work")
+        self.assertEqual(self.db.get_episode(episode_id).file_path, str(self.victim))
+
+    def test_downloads_in_the_download_folder_still_go(self):
+        feed_id, episode_id = self.downloaded("")
+        folder = self.library.feed_folder(self.db.get_feed(feed_id))
+        folder.mkdir(parents=True)
+        (folder / "episode.mp3").write_bytes(b"audio")
+        self.db.update_episode(episode_id, file_path=str(folder / "episode.mp3"))
+        moved = Path(self.tmp) / "new-downloads"
+        self.assertEqual(self.library.move_downloads(str(moved)), 1)
+        self.assertEqual(self.db.get_episode(episode_id).file_path, str(moved / folder.name / "episode.mp3"))
+        self.library.mark_feed_played(feed_id)
+        self.assertFalse((moved / folder.name / "episode.mp3").exists())
+        self.assertFalse(self.db.get_episode(episode_id).is_downloaded)
+
+    def backup(self, *statements):
+        """A database file as someone could hand it over: this library, plus `statements`."""
+        import sqlite3
+
+        path = Path(self.tmp) / f"backup-{len(statements)}-{time.monotonic_ns()}.db"
+        copy = sqlite3.connect(path)
+        self.db.conn().backup(copy)
+        for statement in statements:
+            copy.execute(statement)
+        copy.commit()
+        copy.close()
+        return str(path)
+
+    def test_import_takes_only_plain_tables_and_forgets_foreign_files(self):
+        import sqlite3
+
+        from omapod.config import downloads_dir
+        from omapod.ui.preferences import check_import, prepare_import
+
+        _feed, foreign = self.downloaded(self.victim)
+        feed_id, own = self.downloaded("")
+        own_file = self.library.feed_folder(self.db.get_feed(feed_id)) / "episode.mp3"
+        self.db.update_episode(own, file_path=str(own_file))
+        folder = Path(self.tmp) / "audiobooks"
+        local_id = self.library.add_local_folder(str(folder))
+        with self.db.tx() as conn:
+            inside, outside = (self.db.insert_episode(conn, {"feed_id": local_id, "guid": name, "title": name,
+                                                             "file_path": str(path), "downloaded_at": 1})
+                               for name, path in (("inside", folder / "a.mp3"), ("outside", self.victim)))
+        # Triggers, views and virtual tables would run their own SQL whenever omaPOD changes its database.
+        for extra in ("CREATE TRIGGER t AFTER UPDATE ON episodes BEGIN UPDATE episodes SET file_path = "
+                      f"'{self.victim}', downloaded_at = 1; END",
+                      "CREATE VIEW v AS SELECT * FROM episodes",
+                      "CREATE VIRTUAL TABLE r USING rtree(id, a, b)"):
+            with self.subTest(extra.split(" AS ")[0][:24]):
+                self.assertEqual(check_import(self.backup(extra)), "This file is not an omaPOD database.")
+        path = self.backup()
+        self.assertIsNone(check_import(path))
+        self.assertIsNone(prepare_import(path))
+        rows = dict(sqlite3.connect(path).execute("SELECT id, file_path FROM episodes"))
+        self.assertEqual((rows[foreign], rows[own], rows[inside], rows[outside]),
+                         ("", str(own_file), str(folder / "a.mp3"), ""))
+        self.assertTrue(str(own_file).startswith(str(downloads_dir())))
+        damaged = Path(self.backup())
+        conn = sqlite3.connect(damaged)
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = 'episodes'").fetchone()[0]
+        conn.close()
+        data = bytearray(damaged.read_bytes())
+        data[(root - 1) * page_size] = 0x0f  # no valid page type for the episodes table's first page
+        damaged.write_bytes(bytes(data))
+        self.assertRegex(check_import(str(damaged)) or "", r"^This file is not an omaPOD database \(.+\)\.$")
+
+
 class TwoProcesses(Servers):
     """The app and the hourly background refresh share settings, database and download folder."""
 
@@ -1017,6 +1252,61 @@ class PrivateFiles(unittest.TestCase):
         export = Path(tmp) / "export.db"
         export_database(SimpleNamespace(db=db), str(export))
         self.assertEqual(mode(export), 0o600)
+
+    def test_exports_are_private_from_their_first_byte(self):
+        """Marketplace review of 0.1.1: SQLite created the database export readable for everyone (umask 022) and
+        filled it before the chmod; another user could open it meanwhile and keep reading the passwords."""
+        import os
+        import sqlite3
+        import stat
+        from types import SimpleNamespace
+
+        from omapod.ui.preferences import export_database, write_export
+
+        tmp, _settings, db, _library = make_env()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.addCleanup(db.close)
+        with db.tx() as conn:
+            conn.execute("INSERT INTO feeds(url, title, state, username, password) "
+                         "VALUES('https://p.example/', 'p', 1, 'u', 'secret')")
+        self.addCleanup(os.umask, os.umask(0o022))
+        shared = Path(tmp) / "shared"
+        shared.mkdir(mode=0o755)
+        target = shared / "backup.db"
+        seen = []
+
+        def look():
+            seen.extend((p.name, stat.S_IMODE(p.stat().st_mode)) for p in shared.iterdir())
+
+        class Library:  # the library's connection, watching the folder while the copy is written
+            def backup(self, destination, **kwargs):
+                look()
+                db.conn().backup(destination, **kwargs)
+                look()
+
+        app = SimpleNamespace(db=SimpleNamespace(conn=Library))
+        export_database(app, str(target))
+        self.assertTrue(seen)
+        self.assertEqual([(name, mode) for name, mode in seen if mode & 0o077], [])
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        self.assertEqual([p.name for p in shared.iterdir()], ["backup.db"])  # nothing left behind
+        check = sqlite3.connect(target)
+        self.assertEqual(check.execute("SELECT password FROM feeds").fetchall(), [("secret",)])
+        check.close()
+        # An older export others can read is replaced, not written into: whoever opened it keeps the old file.
+        target.chmod(0o644)
+        with open(target, "rb") as held:
+            export_database(app, str(target))
+            self.assertNotEqual(os.fstat(held.fileno()).st_ino, target.stat().st_ino)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        for name in ("subscriptions.opml", "favorites.html"):
+            (shared / name).write_text("old")
+            (shared / name).chmod(0o644)
+            write_export(str(shared / name), "<opml/>")
+            self.assertEqual(((shared / name).read_text(), stat.S_IMODE((shared / name).stat().st_mode)),
+                             ("<opml/>", 0o600))
+        self.assertEqual(sorted(p.name for p in shared.iterdir()),
+                         ["backup.db", "favorites.html", "subscriptions.opml"])
 
     def test_secrets_are_kept_apart_from_the_settings(self):
         import os

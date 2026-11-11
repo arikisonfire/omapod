@@ -37,6 +37,10 @@ class SyncState:
         self.devices = {}
         self.clock = int(time.time())
         self.login_polls = 0
+        # Addresses a Nextcloud behind a proxy may name in the Login Flow (base of login page and poll endpoint,
+        # server in the poll answer); None: its own.
+        self.login_base = None
+        self.login_server = None
 
     def tick(self):
         # Real servers use epoch seconds; run one second ahead so changes made in the same
@@ -242,8 +246,9 @@ class Handler(BaseHTTPRequestHandler):
             state.add_actions(json.loads(body))
             return self._json({"timestamp": int(time.time())})
         if path == "/index.php/login/v2":
-            return self._json({"poll": {"token": "tok", "endpoint": self.base + "/login/v2/poll"},
-                               "login": self.base + "/login/v2/flow/abc"})
+            base = state.login_base or self.base
+            return self._json({"poll": {"token": "tok", "endpoint": base + "/login/v2/poll"},
+                               "login": base + "/login/v2/flow/abc"})
         # Servers that only look like a Nextcloud: an incomplete answer, a login page that is no web page
         if path == "/broken/index.php/login/v2":
             return self._json({"poll": {"token": "tok"}})
@@ -254,7 +259,7 @@ class Handler(BaseHTTPRequestHandler):
             state.login_polls += 1
             if state.login_polls < 2:
                 return self._send(404, b"", "text/plain")
-            return self._json({"server": self.base, "loginName": "user", "appPassword": "pass"})
+            return self._json({"server": state.login_server or self.base, "loginName": "user", "appPassword": "pass"})
         if path.startswith("/api/2/auth/"):
             if not self._auth_ok():
                 return self._send(401)

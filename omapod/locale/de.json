@@ -702,6 +702,10 @@
  "unknown": "unbekannt",
  "updates disabled": "Aktualisierung aus",
  "{d} d {h} h": "{d} T {h} Std.",
+ "{file} is not in the download folder, so omaPOD left it where it is.": [
+  "{file} liegt nicht im Download-Ordner, deshalb hat omaPOD die Datei dort gelassen.",
+  "{n} Dateien liegen nicht im Download-Ordner, deshalb hat omaPOD sie dort gelassen."
+ ],
  "{host} answers only without encryption (http).": "{host} antwortet nur unverschlüsselt (http).",
  "{host} answers only without encryption (http). It is in your local network or VPN, where this can be acceptable, but your app password and listening history travel through it unencrypted. Continue only if this is your server and your network.": "{host} antwortet nur unverschlüsselt (http). Die Adresse liegt in deinem lokalen Netzwerk oder VPN, wo das vertretbar sein kann, aber App-Passwort und Hörverlauf gehen dort unverschlüsselt durch. Fahre nur fort, wenn das dein Server und dein Netzwerk ist.",
  "{host} answers only without encryption (http). Over the internet, your app password and listening history could be read along the way, so omaPOD logs in only with https there. Set up https on the Nextcloud, or reach it through your home network or VPN.": "{host} antwortet nur unverschlüsselt (http). Über das Internet könnten App-Passwort und Hörverlauf unterwegs mitgelesen werden, deshalb meldet sich omaPOD dort nur mit https an. Richte https auf der Nextcloud ein oder erreiche sie über dein Heimnetz oder VPN.",
