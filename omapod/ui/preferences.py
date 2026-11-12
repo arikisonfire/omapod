@@ -1,9 +1,11 @@
 """Settings, laid out like AntennaPod's preference screens, plus sync setup,
 backup/restore and the keyboard shortcuts dialog."""
 
+import contextlib
+import os
 import re
-import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -11,8 +13,8 @@ from pathlib import Path
 from gi.repository import Adw, Gio, GLib, Gtk
 
 from .. import APP_NAME
-from ..config import DEFAULTS, own_downloads_dir, owns_file, paths, private_file
-from ..db import SCHEMA_VERSION
+from ..config import DEFAULTS, copy_regular_file, own_downloads_dir, owns_file, paths, private_file
+from ..db import SCHEMA_VERSION, discard_stale
 from ..i18n import _, ngettext
 from ..models import LOCAL_PREFIX
 from ..sync.providers import (GpodderNet, NextcloudLoginFlow, PlainHttpOnly, SyncError, UntrustedCertificate, host_of,
@@ -41,25 +43,70 @@ PAGES = [("home", _("Home")), ("queue", _("Queue")), ("inbox", _("Inbox")), ("ep
          ("subscriptions", _("Subscriptions")), ("downloads", _("Downloads")), ("remember", _("Remember last page"))]
 
 
+# Far beyond any library; a file like this is not one, and copying it would only fill the disk.
+MAX_IMPORT_BYTES = 4 * 1024 ** 3
+
+
 def export_database(app, target):
     """A copy of the library. It holds the passwords of protected podcasts, so it is private from its first byte
-    (config.private_file): SQLite would create it readable for everyone under the usual umask 022."""
-    with private_file(target) as path:
-        destination = sqlite3.connect(path)
-        try:
-            app.db.conn().backup(destination)
-        finally:
-            destination.close()
+    and written through one open file (config.private_file). SQLite itself never opens a file in the folder the
+    export goes to (Database.write_snapshot): it would create it readable for everyone under the usual umask 022,
+    and it opens by name, which in a folder another account can write may by then be a link to somewhere else."""
+    with private_file(target) as handle:
+        app.db.write_snapshot(handle)
 
 
 def write_export(target, text):
     """OPML and HTML exports: private like the database export, as feed addresses can carry access tokens."""
-    with private_file(target) as path, open(path, "w", encoding="utf-8") as handle:
-        handle.write(text)
+    with private_file(target) as handle:
+        handle.write(text.encode("utf-8"))
 
 
 def pending_import_path():
-    return str(paths.db) + ".import"  # swapped in at the next start (__main__._apply_pending_import)
+    from .. import config
+
+    return str(config.paths.db) + ".import"  # swapped in at the next start (__main__._apply_pending_import)
+
+
+@contextlib.contextmanager
+def private_copy(source):
+    """A copy of the file the user chose for import, in omaPOD's own data folder; yields its path. The copy is
+    what gets checked and imported, never the file itself: it may lie in a folder that is not the user's alone,
+    where it can change after the check or have a pipe or a link take its place, and where SQLite would put files
+    of its own next to it (-wal, -shm) and trust the ones it finds there. Gone afterwards, unless it was moved."""
+    folder = os.path.dirname(pending_import_path())
+    discard_stale(folder, ".import-")
+    fd, copy = tempfile.mkstemp(dir=folder, prefix=".import-", suffix=".db")
+    try:
+        with os.fdopen(fd, "wb") as target:
+            copy_regular_file(source, target, MAX_IMPORT_BYTES)
+        yield copy
+    finally:
+        for leftover in (copy, copy + "-journal", copy + "-wal", copy + "-shm"):
+            with contextlib.suppress(OSError):
+                os.unlink(leftover)
+
+
+def check_chosen(source):
+    """None if the file the user chose holds an omaPOD database that can be imported, otherwise why not."""
+    try:
+        with private_copy(source) as copy:
+            return check_import(copy)
+    except (OSError, ValueError) as error:
+        return str(error)
+
+
+def stage_import(source, known=()):
+    """Readies the file the user chose for import: a private copy of it is checked and cleaned (prepare_import)
+    and then waits to replace the library at the next start. Returns a problem text, or None."""
+    try:
+        with private_copy(source) as copy:
+            problem = prepare_import(copy, known)
+            if problem is None:
+                os.replace(copy, pending_import_path())
+            return problem
+    except (OSError, ValueError) as error:
+        return str(error)
 
 
 def check_import(path):
@@ -852,7 +899,7 @@ class Preferences(Adw.PreferencesDialog):
             path = file.get_path() if file else None
             if not path:
                 return
-            problem = check_import(path)
+            problem = check_chosen(path)
             if problem:
                 self.toast(problem, 6)
                 return
@@ -868,14 +915,9 @@ class Preferences(Adw.PreferencesDialog):
                 if response != "ok":
                     return
                 known = {episode.file_path for episode in self.app.db.get_episodes(("downloaded",))}
-                try:
-                    with private_file(pending_import_path()) as copy:
-                        shutil.copyfile(path, copy)
-                        problem = prepare_import(copy, known)
-                        if problem:
-                            raise ValueError(problem)
-                except (OSError, ValueError) as error:
-                    self.toast(str(error), 6)
+                problem = stage_import(path, known)
+                if problem:
+                    self.toast(problem, 6)
                     return
                 restart_app(self.app)
 

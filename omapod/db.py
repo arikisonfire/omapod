@@ -5,12 +5,15 @@ Database.tx(). All SQL lives here; the rules (what marking an episode as
 played implies, auto-download, cleanup) live in core/library.py.
 """
 
+import glob
 import json
 import os
 import random
+import shutil
 import sqlite3
+import tempfile
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 
 from .models import FEED_PREVIEW, FEED_SUBSCRIBED, NEW, PLAYED, UNPLAYED, Episode, Feed
 
@@ -285,6 +288,46 @@ def make_private(path):
             pass
 
 
+def discard_stale(folder, prefix):
+    """Removes omaPOD's working copies (.snapshot-*, .import-*) that a killed run left in its data folder."""
+    for stale in glob.glob(os.path.join(glob.escape(str(folder)), prefix + "*")):
+        with suppress(OSError):
+            os.unlink(stale)
+
+
+def write_snapshot(conn, handle, folder):
+    """Writes a consistent copy of the database behind `conn` (with what is still in its write-ahead log) into
+    the open file `handle`: an export or a backup.
+
+    SQLite writes only to a file it opens by name, and the folder an export goes to may be one that another
+    account can write, where a symbolic link could wait under that name. So SQLite makes the copy in `folder`,
+    which has to be omaPOD's own data folder (0700: nobody else can enter it, the library itself lives there),
+    and the bytes go from there into the file that is already open (config.private_file)."""
+    discard_stale(folder, ".snapshot-")
+    fd, staging = tempfile.mkstemp(dir=folder, prefix=".snapshot-", suffix=".db")
+    try:
+        with os.fdopen(fd, "rb") as source:  # kept open: the copy is read back through this descriptor
+            copy = sqlite3.connect(staging)
+            try:
+                conn.backup(copy)
+            finally:
+                copy.close()
+            # The copy took over the library's write-ahead mode. As a plain single file it can be read wherever it
+            # ends up (a read-only medium, say) without -wal and -shm files next to it. A new connection, which
+            # reads the mode from the file; if that fails, the copy is complete all the same.
+            with suppress(sqlite3.Error):
+                plain = sqlite3.connect(staging)
+                try:
+                    plain.execute("PRAGMA journal_mode=DELETE")
+                finally:
+                    plain.close()
+            shutil.copyfileobj(source, handle, 1024 * 1024)
+    finally:
+        for leftover in (staging, staging + "-journal", staging + "-wal", staging + "-shm"):
+            with suppress(OSError):
+                os.unlink(leftover)
+
+
 class Database:
     def __init__(self, path):
         self.path = str(path)
@@ -314,6 +357,10 @@ class Database:
         if conn is not None:
             conn.close()
             self._local.conn = None
+
+    def write_snapshot(self, handle):
+        """A copy of the library into an open file (see write_snapshot above), made next to the library itself."""
+        write_snapshot(self.conn(), handle, os.path.dirname(self.path))
 
     @contextmanager
     def tx(self):

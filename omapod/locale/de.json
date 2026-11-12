@@ -611,6 +611,8 @@
  "This episode has no show notes.": "Diese Episode hat keine Shownotes.",
  "This file is not an omaPOD database ({error}).": "Diese Datei ist keine omaPOD-Datenbank ({error}).",
  "This file is not an omaPOD database.": "Diese Datei ist keine omaPOD-Datenbank.",
+ "This file is too large.": "Diese Datei ist zu groß.",
+ "This is not a regular file.": "Das ist keine normale Datei.",
  "This podcast has no episodes yet.": "Dieser Podcast hat noch keine Episoden.",
  "This podcast needs a username and password.": "Dieser Podcast braucht Benutzername und Passwort.",
  "This podcast's address is not encrypted (http): its username and password travel in plain text, and others on the network can read them.": "Die Adresse dieses Podcasts ist nicht verschlüsselt (http): Benutzername und Passwort gehen im Klartext übers Netz, und andere im Netzwerk können sie mitlesen.",
@@ -705,6 +707,10 @@
  "unknown": "unbekannt",
  "updates disabled": "Aktualisierung aus",
  "{d} d {h} h": "{d} T {h} Std.",
+ "{file} is in a folder that other accounts can change, so omaPOD left it where it is.": [
+  "{file} liegt in einem Ordner, den andere Konten ändern können, deshalb hat omaPOD die Datei dort gelassen.",
+  "{n} Dateien liegen in Ordnern, die andere Konten ändern können, deshalb hat omaPOD sie dort gelassen."
+ ],
  "{file} is not in the download folder, so omaPOD left it where it is.": [
   "{file} liegt nicht im Download-Ordner, deshalb hat omaPOD die Datei dort gelassen.",
   "{n} Dateien liegen nicht im Download-Ordner, deshalb hat omaPOD sie dort gelassen."
@@ -787,5 +793,6 @@
   "{started} von {total} Episoden angefangen"
  ],
  "{time} left": "noch {time}",
+ "“{folder}” in the download folder is a link or a file, not a folder, so omaPOD does not download into it.": "„{folder}“ im Download-Ordner ist ein Link oder eine Datei, kein Ordner. omaPOD lädt deshalb nichts dorthin.",
  "“{what}” needs a username and password.": "„{what}“ braucht Benutzername und Passwort."
 }

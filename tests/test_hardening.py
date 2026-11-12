@@ -2,12 +2,17 @@
 Everything runs against local servers; a second host name for the same machine is "localhost"."""
 
 import base64
+import contextlib
+import errno
 import gzip
 import html
 import json
+import os
 import re
 import shutil
+import sqlite3
 import ssl
+import stat
 import threading
 import time
 import unittest
@@ -529,6 +534,11 @@ class CertificateTrust(Servers):
         self.assertEqual(der, ssl.PEM_cert_to_DER_cert(Path(tls[0]).read_text()))
         self.assertEqual(proxy.seen, [(server.base.removeprefix("https://"),
                                        "Basic " + base64.b64encode(b"me:pw").decode())])
+        # The names shown with the fingerprint are decoded from a file in omaPOD's own folder, not in the shared
+        # one for temporary files, and the file is gone afterwards.
+        with mock.patch("tempfile.gettempdir", side_effect=AssertionError("the shared folder for temporary files")):
+            self.assertIn("127.0.0.1", http.describe_certificate(der)["subject"])
+        self.assertEqual(list(config.paths.cache.glob("*.pem")), [])
 
     def test_servers_on_the_internet_get_the_stronger_warning(self):
         from omapod.sync import providers
@@ -1363,6 +1373,364 @@ class ImportedFolders(Backups):
         self.assertEqual(list((Path(self.tmp) / "images").glob("*.png")), [])
 
 
+@contextlib.contextmanager
+def another_account(folder, target):
+    """What another account that can write `folder` does at the worst moment: as soon as omaPOD has created a file
+    there, the file loses its name to a link to `target`. Replayed in this process right after the file exists; in
+    the review notes the same moment is won in a real race."""
+    real_open = os.open
+
+    def swapping(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if flags & os.O_EXCL:
+            with os.scandir(folder) as entries:
+                for entry in list(entries):
+                    if entry.name.startswith(".") and entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+                        os.symlink(target, entry.path)
+        return fd
+
+    with mock.patch("os.open", swapping):
+        yield
+
+
+class SharedFolder(Backups):
+    """A folder another account can write too (and that has no sticky bit), next to the user's own files."""
+
+    def setUp(self):
+        super().setUp()
+        self.shared = Path(self.tmp) / "srv" / "shared"
+        self.shared.mkdir(parents=True)
+        self.shared.chmod(0o777)
+
+    def own_download(self, podcast, name, content=b"the download"):
+        """A download in the download folder, as omaPOD made it."""
+        feed_id, episode_id = self.downloaded("")
+        self.db.update_feed(feed_id, title=podcast)
+        folder = self.library.feed_folder(self.db.get_feed(feed_id))
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / name).write_bytes(content)
+        self.db.update_episode(episode_id, file_path=str(folder / name))
+        return feed_id, episode_id, folder / name
+
+
+class SharedFolders(SharedFolder):
+    """Marketplace review of 0.1.3: an export created its temporary file safely, closed it and opened it again by
+    name. In a folder another account can write, that account puts a link under the name in between, and the
+    export is written through it: over one of the user's other files, or into a file the other account reads. The
+    same holds wherever omaPOD writes in a folder that may not be the user's alone: the download folder the user
+    chose and the one downloads move to. There, omaPOD opens the folder once, works relative to it and writes only
+    through files it holds open; it follows no link."""
+
+    def test_an_export_is_written_through_the_file_it_created(self):
+        from types import SimpleNamespace
+
+        from omapod import config
+        from omapod.ui.preferences import export_database, write_export
+
+        with self.db.tx() as conn:
+            conn.execute("INSERT INTO feeds(url, title, state, username, password) "
+                         "VALUES('https://p.example/', 'p', 1, 'u', 'feed-password')")
+        theirs = self.shared.parent / "theirs"  # a file the other account owns and reads
+        theirs.write_bytes(b"")
+        app = SimpleNamespace(db=self.db)
+        for name, export, target in (
+                ("subscriptions.opml", lambda path: write_export(path, "<opml>token</opml>"), self.victim),
+                ("favorites.html", lambda path: write_export(path, "<html>token</html>"), self.victim),
+                ("backup.db", lambda path: export_database(app, path), theirs)):
+            with self.subTest(name):
+                with another_account(self.shared, target):
+                    try:
+                        export(str(self.shared / name))
+                    except OSError:
+                        pass  # it may notice; what counts is where the bytes went
+                self.assertEqual(self.victim.read_bytes(), b"years of work")
+                self.assertEqual(theirs.read_bytes(), b"")
+        for entry in self.shared.iterdir():
+            entry.unlink()
+        # Left alone, an export arrives whole and private, and nothing else stays behind, here or at home (not
+        # even what a killed export left there).
+        (config.paths.data / ".snapshot-killed.db").write_bytes(b"left over")
+        write_export(str(self.shared / "subscriptions.opml"), "<opml/>")
+        export_database(app, str(self.shared / "backup.db"))
+        self.assertEqual(sorted((p.name, stat.S_IMODE(p.lstat().st_mode), p.is_symlink())
+                                for p in self.shared.iterdir()),
+                         [("backup.db", 0o600, False), ("subscriptions.opml", 0o600, False)])
+        self.assertEqual((self.shared / "subscriptions.opml").read_text(), "<opml/>")
+        copy = sqlite3.connect(self.shared / "backup.db")
+        self.assertEqual(copy.execute("SELECT password FROM feeds WHERE username = 'u'").fetchall(),
+                         [("feed-password",)])
+        copy.close()
+        self.assertEqual(sorted(p.name for p in config.paths.data.iterdir() if p.name.startswith(".")), [])
+        # One plain file, not in write-ahead mode: SQLite reads it on a read-only medium and puts nothing next to it.
+        self.assertEqual(tuple((self.shared / "backup.db").read_bytes()[18:20]), (1, 1))
+        self.assertEqual(sorted(p.name for p in self.shared.iterdir()), ["backup.db", "subscriptions.opml"])
+
+    def test_changing_the_download_folder_follows_no_link_there(self):
+        _feed, one, first = self.own_download("Alpha", "one.mp3")
+        _feed, two, second = self.own_download("Beta", "two.mp3")
+        _feed, three, third = self.own_download("Gamma", "three.mp3")
+        os.utime(third, (1_000_000_000, 1_000_000_000))
+        # The other account knows a podcast's name and waits with a link in place of its folder.
+        (self.shared / "Alpha").symlink_to(self.documents)
+        real_link, real_move = os.link, shutil.move
+
+        def racing(source, target, *args, **kwargs):
+            """For Beta, a link takes the target's name at the last moment; Gamma is on another file system."""
+            folder = self.shared / "Beta"
+            if str(target) in ("two.mp3", str(folder / "two.mp3")) and not os.path.lexists(folder / "two.mp3"):
+                (folder / "two.mp3").symlink_to(self.documents)
+            if str(target).startswith("three"):
+                if not os.path.lexists(self.shared / "Gamma" / "three.mp3"):
+                    (self.shared / "Gamma" / "three.mp3").symlink_to(self.victim)
+                raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+            return (real_link if kwargs else real_move)(source, target, *args, **kwargs)
+
+        with mock.patch("os.link", racing), mock.patch("shutil.move", racing):
+            self.assertEqual(self.library.move_downloads(str(self.shared)), 2)
+        self.assertEqual(sorted(p.name for p in self.documents.iterdir()), ["thesis.pdf"])
+        self.assertEqual(self.victim.read_bytes(), b"years of work")
+        # Alpha's download stayed where it was; the others took a free name next to the links.
+        self.assertEqual(self.db.get_episode(one).file_path, str(first))
+        self.assertEqual(first.read_bytes(), b"the download")
+        for episode_id, old, folder, name in ((two, second, "Beta", "two (2).mp3"),
+                                              (three, third, "Gamma", "three (2).mp3")):
+            moved = Path(self.db.get_episode(episode_id).file_path)
+            self.assertEqual(moved, self.shared / folder / name)
+            self.assertEqual((moved.read_bytes(), moved.is_symlink(), old.exists()), (b"the download", False, False))
+        self.assertEqual(int((self.shared / "Gamma" / "three (2).mp3").stat().st_mtime), 1_000_000_000)
+
+    def test_deleting_a_download_follows_no_link_put_there_after_the_check(self):
+        from omapod import config
+
+        feed_id, episode_id, download = self.own_download("Cast", "thesis.pdf")
+        real_check = config.is_download
+
+        def then_swapped(path):
+            """The other account swaps the podcast's folder for a link once omaPOD has looked at it."""
+            result = real_check(path)
+            if result and not download.parent.is_symlink():
+                download.parent.rename(download.parent.with_name("Cast.moved"))
+                download.parent.symlink_to(self.documents)
+            return result
+
+        with mock.patch.object(config, "is_download", then_swapped):
+            self.library.delete_downloads([episode_id])
+        self.assertEqual(self.victim.read_bytes(), b"years of work")
+        self.assertFalse(self.db.get_episode(episode_id).is_downloaded)
+
+    def test_the_file_chosen_for_import_is_copied_before_anything_reads_it(self):
+        from omapod import config
+        from omapod.ui import preferences
+        from omapod.ui.preferences import check_chosen, pending_import_path, stage_import
+
+        (config.paths.data / ".import-killed.db-wal").write_bytes(b"left by a run that was killed")
+        stick = Path(self.tmp) / "stick"
+        stick.mkdir()
+        chosen = stick / "backup.db"
+        shutil.move(self.backup(), chosen)
+        stick.chmod(0o555)  # a read-only medium
+        self.addCleanup(stick.chmod, 0o755)
+        self.assertIsNone(check_chosen(str(chosen)))
+        self.assertIsNone(stage_import(str(chosen)))
+        self.assertEqual(sorted(p.name for p in stick.iterdir()), ["backup.db"])  # SQLite put nothing next to it
+        pending = Path(pending_import_path())
+        self.assertEqual(stat.S_IMODE(pending.stat().st_mode), 0o600)
+        self.assertEqual(sqlite3.connect(pending).execute("PRAGMA integrity_check").fetchone(), ("ok",))
+        pending.unlink()
+        # A pipe, a device or a file of absurd size under the chosen name does not hold omaPOD up or fill the disk.
+        pipe = Path(self.tmp) / "pipe.db"
+        os.mkfifo(pipe)
+        (Path(self.tmp) / "link.db").symlink_to(pipe)
+        started = time.monotonic()
+        for odd in (pipe, Path(self.tmp) / "link.db", Path("/dev/zero")):
+            with self.subTest(odd.name):
+                self.assertEqual(check_chosen(str(odd)), "This is not a regular file.")
+                self.assertEqual(stage_import(str(odd)), "This is not a regular file.")
+        self.assertLess(time.monotonic() - started, 5)
+        with mock.patch.object(preferences, "MAX_IMPORT_BYTES", 1024):
+            self.assertEqual(check_chosen(str(chosen)), "This file is too large.")
+        self.assertEqual(check_chosen(str(Path(self.tmp) / "nothing.db"))[:9], "[Errno 2]")
+        # What is not a library is refused as before, and no copy stays behind in the data folder.
+        (Path(self.tmp) / "notes.db").write_text("not a database")
+        self.assertIn("not an omaPOD database", stage_import(str(Path(self.tmp) / "notes.db")))
+        self.assertFalse(pending.exists())
+        self.assertEqual(sorted(p.name for p in config.paths.data.iterdir() if p.name.startswith(".")), [])
+
+    def test_files_of_an_added_folder_that_others_can_change_stay(self):
+        """An added folder is trusted by its path. Where another account can write, it can make the path lead to
+        another folder of the user's: it renames the folder and puts a link under the name (0.1.2's review, with
+        another account in place of the backup). omaPOD still plays what it finds there, but the trash works by
+        path, so nothing in such a place goes to the trash."""
+        from omapod.config import others_can_change
+        from omapod.events import bus
+
+        music = self.shared / "music"
+        music.mkdir()
+        shutil.copy(FIX / "tone.mp3", music / "song.mp3")
+        books = self.documents.parent / "Audiobooks"  # the user's own
+        books.mkdir()
+        for name in ("chapter-01.mp3", "chapter-02.mp3"):
+            shutil.copy(FIX / "tone.mp3", books / name)
+        feed_id = self.library.add_local_folder(str(music))
+        music.rename(self.shared / "music.away")
+        music.symlink_to(books)
+        self.assertEqual(self.library.refresh_feed(feed_id).error, "")
+        self.assertEqual(sorted(e.title for e in self.db.get_episodes(feed_id=feed_id)), ["chapter-01", "chapter-02"])
+        self.settings.update({"auto_delete": True, "auto_delete_local": True})
+        messages, trashed = [], []
+        self.addCleanup(bus.unsubscribe, bus.subscribe("message", lambda text, kind: messages.append(text)))
+        with mock.patch("omapod.core.library.move_to_trash", trashed.append):
+            self.library.mark_feed_played(feed_id)  # the review's way: delete after playing, Mark all as played
+            ids = [e.id for e in self.db.get_episodes(feed_id=feed_id)]
+            self.assertEqual(self.library.delete_downloads(ids, local_files=True), 0)  # asked for and confirmed
+        self.assertEqual(trashed, [])
+        self.assertEqual(self.db.count_episodes(feed_id=feed_id), 2)  # the episodes stay with their files
+        self.assertEqual(messages, ["2 files are in folders that other accounts can change, so omaPOD left them "
+                                    "where they are."])
+        # Which places count: any folder on the way that somebody else owns or can write, sticky ones aside.
+        own = self.documents.parent / "Music"
+        group = self.documents.parent / "Family"
+        sticky = self.shared.parent / "tmp"
+        for folder, mode in ((own, 0o755), (group, 0o775), (sticky, 0o1777), (sticky / "mine", 0o755)):
+            folder.mkdir()
+            folder.chmod(mode)
+        (own / "link").symlink_to(sticky / "mine")  # the user's own links are fine, wherever they lead safely
+        (own / "out").symlink_to("../Family")
+        (own / "loop").symlink_to("loop")
+        self.assertEqual([others_can_change(str(folder / "a.mp3")) for folder in (
+            own, own / "link", sticky / "mine", books,
+            group, group / "below", own / "out", self.shared, self.shared / "music.away", music, own / "gone",
+            own / "loop")], [False] * 4 + [True] * 8)
+
+    def test_an_opml_file_is_read_only_if_it_is_a_file(self):
+        from omapod.ui.pages import add
+
+        pipe = Path(self.tmp) / "subscriptions.opml"
+        os.mkfifo(pipe)
+        started = time.monotonic()
+        with self.assertRaisesRegex(ValueError, "not a regular file"):
+            add.read_opml_file(str(pipe))
+        self.assertLess(time.monotonic() - started, 5)
+        listed = Path(self.tmp) / "list.opml"
+        listed.write_text('<opml><body><outline text="One" xmlUrl="https://one.example/feed"/></body></opml>')
+        self.assertEqual([entry["url"] for entry in add.read_opml_file(str(listed))], ["https://one.example/feed"])
+        with mock.patch.object(add, "MAX_OPML_BYTES", 16), self.assertRaisesRegex(ValueError, "too large"):
+            add.read_opml_file(str(listed))
+
+
+class SharedDownloadFolder(SharedFolder):
+    """The download folder the user chose is such a folder too (a shared media folder). Downloads are written to
+    .<episode id>.part in their podcast's folder, a name anyone can work out, so here no race is needed: the link
+    waits there before the download starts."""
+
+    def setUp(self):
+        super().setUp()
+        from omapod.models import FEED_SUBSCRIBED
+
+        self.settings.set("downloads_dir", str(self.shared))
+        self.audio = (FIX / "tone.mp3").read_bytes()
+        self.server = self.host()
+        self.server.routes["/ep.mp3"] = (200, {"Content-Type": "audio/mpeg"}, self.audio)
+        with self.db.tx() as conn:
+            self.cast = self.db.insert_feed(conn, {"url": self.server.base + "/feed.xml", "title": "Shared Cast",
+                                                   "state": FEED_SUBSCRIBED})
+        self.folder = self.shared / "Shared Cast"
+        self.folder.mkdir()
+
+    def episode(self, title, path="/ep.mp3", feed_id=None):
+        with self.db.tx() as conn:
+            return self.db.insert_episode(conn, {"feed_id": feed_id or self.cast, "guid": title, "title": title,
+                                                 "media_url": self.server.base + path, "media_type": "audio/mpeg",
+                                                 "media_size": len(self.audio)})
+
+    def download(self, episode_id):
+        from omapod.net.downloads import DownloadManager
+
+        manager = DownloadManager(self.library, self.settings)
+        self.library.downloads = manager
+        manager.start()
+        self.library.download([episode_id])
+        deadline = time.monotonic() + 30
+        while manager.active_ids() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        manager.stop()
+        log = self.db.get_log(1)
+        return self.db.get_episode(episode_id), (log[0]["reason"] if log else "")
+
+    def test_a_download_is_never_written_through_what_waits_under_its_name(self):
+        elsewhere = self.documents / "new-file"
+        for title, plant in (
+                ("a link to a file of the user", lambda part: part.symlink_to(self.victim)),
+                ("a link to a file that does not exist yet", lambda part: part.symlink_to(elsewhere)),
+                ("a second name of the user's file", lambda part: os.link(self.victim, part)),
+                ("a pipe", os.mkfifo)):
+            with self.subTest(title):
+                episode_id = self.episode(title)
+                part = self.folder / f".{episode_id}.part"
+                plant(part)
+                episode, reason = self.download(episode_id)
+                self.assertEqual(self.victim.read_bytes(), b"years of work")
+                self.assertFalse(elsewhere.exists())
+                self.assertTrue(episode.is_downloaded, reason)
+                arrived = Path(episode.file_path)
+                self.assertEqual((arrived.parent, arrived.read_bytes(), arrived.is_symlink(), arrived.stat().st_nlink),
+                                 (self.folder, self.audio, False, 1))
+                self.assertFalse(os.path.lexists(part))
+        self.assertEqual(sorted(p.name for p in self.documents.iterdir()), ["thesis.pdf"])
+
+    def test_a_stale_part_starts_again_and_a_good_one_continues(self):
+        """What the old code did by name (truncate after HTTP 416, append to resume) now goes through the open
+        file."""
+        ranges = []
+
+        def media(handler):
+            requested = handler.headers.get("Range")
+            ranges.append(requested)
+            start = int(requested.split("=")[1].rstrip("-")) if requested else 0
+            if start >= len(self.audio):
+                handler.send_response(416)
+                handler.send_header("Content-Length", "0")
+                handler.end_headers()
+                return
+            body = self.audio[start:]
+            handler.send_response(206 if requested else 200)
+            handler.send_header("Content-Type", "audio/mpeg")
+            handler.send_header("Content-Length", str(len(body)))
+            if requested:
+                handler.send_header("Content-Range", f"bytes {start}-{len(self.audio) - 1}/{len(self.audio)}")
+            handler.end_headers()
+            handler.wfile.write(body)
+
+        self.server.routes["/ranges.mp3"] = media
+        size = len(self.audio)
+        for title, left_over, asked in (("stale", b"x" * (size + 10), [f"bytes={size + 10}-", None]),
+                                        ("half", self.audio[:1000], ["bytes=1000-"])):
+            with self.subTest(title):
+                del ranges[:]
+                episode_id = self.episode(title, "/ranges.mp3")
+                (self.folder / f".{episode_id}.part").write_bytes(left_over)
+                episode, reason = self.download(episode_id)
+                self.assertTrue(episode.is_downloaded, reason)
+                self.assertEqual(Path(episode.file_path).read_bytes(), self.audio)
+                self.assertEqual(ranges, asked)
+        self.assertEqual(sorted(p.name for p in self.folder.iterdir()), ["half.mp3", "stale.mp3"])
+
+    def test_a_podcast_folder_that_is_a_link_gets_no_downloads(self):
+        from omapod.models import FEED_SUBSCRIBED
+
+        (self.shared / "Linked Cast").symlink_to(self.documents)
+        with self.db.tx() as conn:
+            feed_id = self.db.insert_feed(conn, {"url": self.server.base + "/linked.xml", "title": "Linked Cast",
+                                                 "state": FEED_SUBSCRIBED})
+        episode, reason = self.download(self.episode("three", feed_id=feed_id))
+        self.assertFalse(episode.is_downloaded)
+        self.assertEqual(reason, "“Linked Cast” in the download folder is a link or a file, not a folder, so "
+                                 "omaPOD does not download into it.")
+        self.assertEqual(sorted(p.name for p in self.documents.iterdir()), ["thesis.pdf"])
+        self.assertEqual(self.server.seen, [])  # nothing was even asked for
+
+
 class TwoProcesses(Servers):
     """The app and the hourly background refresh share settings, database and download folder."""
 
@@ -1492,13 +1860,14 @@ class PrivateFiles(unittest.TestCase):
         def look():
             seen.extend((p.name, stat.S_IMODE(p.stat().st_mode)) for p in shared.iterdir())
 
-        class Library:  # the library's connection, watching the folder while the copy is written
-            def backup(self, destination, **kwargs):
+        class Library:  # the library, watching the folder while its copy is written
+            def write_snapshot(self, handle):
                 look()
-                db.conn().backup(destination, **kwargs)
+                db.write_snapshot(handle)
+                handle.flush()
                 look()
 
-        app = SimpleNamespace(db=SimpleNamespace(conn=Library))
+        app = SimpleNamespace(db=Library())
         export_database(app, str(target))
         self.assertTrue(seen)
         self.assertEqual([(name, mode) for name, mode in seen if mode & 0o077], [])

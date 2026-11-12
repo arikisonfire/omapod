@@ -1,5 +1,13 @@
-"""Episode downloads: a small worker pool with resume, progress and cancel."""
+"""Episode downloads: a small worker pool with resume, progress and cancel.
 
+A download is written to <download folder>/<podcast>/.<episode id>.part and gets its name when it is complete.
+The download folder can be one the user chose, and one that other accounts write too (a shared media folder), so
+nothing in it is opened, truncated, renamed or deleted by its name: the podcast's folder is opened once, without
+following a symbolic link, and the file is created in it, written through its open descriptor and renamed
+relative to the folder (see "Folders other people may be able to write" in config.py)."""
+
+import contextlib
+import errno
 import fcntl
 import os
 import shutil
@@ -11,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from ..config import is_same_file, name_taken, open_partial, open_podcast_folder
 from ..events import bus
 from ..i18n import _
 from ..util import safe_filename
@@ -136,20 +145,19 @@ class DownloadManager:
                 bus.emit("downloads-changed")
                 bus.emit("episodes-changed", {job.episode_id})
 
-    def _target_path(self, episode, feed, mime):
-        folder = self.library.feed_folder(feed)
-        folder.mkdir(parents=True, exist_ok=True)
+    def _target_name(self, folder_fd, episode, mime):
+        """A free name in the podcast's (open) folder for the finished download."""
         url_name = unquote(os.path.basename(urlsplit(episode.media_url).path))
         ext = os.path.splitext(url_name)[1].lower()
         if ext not in KNOWN_EXT:
             ext = MIME_EXT.get((mime or episode.media_type or "").split(";")[0].strip().lower(), ".mp3")
         base = safe_filename(episode.title or os.path.splitext(url_name)[0] or f"episode-{episode.id}", 100)
-        target = folder / f"{base}{ext}"
+        name = f"{base}{ext}"
         counter = 2
-        while target.exists():
-            target = folder / f"{base} ({counter}){ext}"
+        while name_taken(folder_fd, name):
+            name = f"{base} ({counter}){ext}"
             counter += 1
-        return target
+        return name
 
     def _download(self, job):
         episode = self.library.db.get_episode(job.episode_id, full=False)
@@ -158,22 +166,50 @@ class DownloadManager:
         feed = self.library.db.get_feed(episode.feed_id)
         if feed is None:
             return
-        part = self.library.feed_folder(feed) / f".{episode.id}.part"
-        part.parent.mkdir(parents=True, exist_ok=True)
-        # Locked while it is written: the background refresh and the app must never write one file at once.
-        with open(part, "ab") as guard:
+        folder = self.library.feed_folder(feed)
+        part = f".{episode.id}.part"
+        try:
+            folder_fd = open_podcast_folder(folder.name, create=True, root=folder.parent)
+        except OSError as error:
+            reason, detail = http.describe_error(error)
+            if error.errno in (errno.ENOTDIR, errno.ELOOP):
+                reason = _("“{folder}” in the download folder is a link or a file, not a folder, so omaPOD does "
+                           "not download into it.").format(folder=folder.name)
+            self.library.download_failed(episode.id, reason, detail, job.manual)
+            return
+        try:
             try:
-                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return  # the other process is downloading it right now
-            try:
-                self._fetch(job, episode, feed, part)
-            finally:
-                if part.exists() and not part.stat().st_size:
-                    part.unlink(missing_ok=True)
+                handle = open_partial(folder_fd, part)
+            except OSError as error:
+                self.library.download_failed(episode.id, *http.describe_error(error), job.manual)
+                return
+            with handle:
+                # Locked while it is written: the background refresh and the app must never write one file at
+                # once.
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return  # the other process is downloading it right now
+                try:
+                    self._fetch(job, episode, feed, folder, folder_fd, part, handle)
+                finally:
+                    # Nothing arrived: no empty file stays behind (if the name is still this file's).
+                    with contextlib.suppress(OSError):
+                        if not os.fstat(handle.fileno()).st_size and is_same_file(folder_fd, part, handle):
+                            os.unlink(part, dir_fd=folder_fd)
+        finally:
+            os.close(folder_fd)
 
-    def _fetch(self, job, episode, feed, part):
-        offset = part.stat().st_size
+    def _fetch(self, job, episode, feed, folder, folder_fd, part, handle):
+        """Downloads into `handle`, the open .part file named `part` in the open folder `folder_fd` (`folder` is
+        its path, for the library). Everything goes through these two descriptors."""
+
+        def discard():
+            with contextlib.suppress(OSError):
+                if is_same_file(folder_fd, part, handle):
+                    os.unlink(part, dir_fd=folder_fd)
+
+        offset = os.fstat(handle.fileno()).st_size
         headers = {"Accept": "*/*"}
         if offset:
             headers["Range"] = f"bytes={offset}-"
@@ -186,8 +222,8 @@ class DownloadManager:
         except urllib.error.HTTPError as error:
             error.close()
             if error.code == 416 and offset:
-                os.truncate(part, 0)  # stays locked: the same file starts again
-                return self._fetch(job, episode, feed, part)
+                handle.truncate(0)  # stays open and locked: the same file starts again
+                return self._fetch(job, episode, feed, folder, folder_fd, part, handle)
             reason, detail = http.describe_error(error, episode.media_url)
             if error.code == 401:
                 reason = http.withheld(feed.url, error.geturl()) or reason
@@ -209,7 +245,7 @@ class DownloadManager:
                 self.library.download_failed(episode.id, _("File type error"),
                                              _("The server sent a web page instead of the episode."), job.manual)
                 return
-            free = shutil.disk_usage(part.parent).free
+            free = shutil.disk_usage(folder_fd).free
             if length and free < length + FREE_SPACE_RESERVE:
                 self.library.download_failed(episode.id, _("There is not enough space left on your device."),
                                              f"{length} bytes needed, {free} free", job.manual)
@@ -219,38 +255,41 @@ class DownloadManager:
             job.total = total
             job.received = offset
             checked = offset
-            with open(part, "ab" if offset else "wb") as handle:
-                while True:
-                    if job.cancelled:
+            handle.truncate(offset)  # what is there continues (offset is its size), or it starts again at 0
+            handle.seek(offset)
+            while True:
+                if job.cancelled:
+                    break
+                try:
+                    chunk = response.read(256 * 1024)
+                except (OSError, http.HttpError) as error:
+                    reason, detail = http.describe_error(error, episode.media_url)
+                    handle.flush()
+                    self.library.download_failed(episode.id, _("The server connection was lost before "
+                                                               "completing the download"), detail, job.manual)
+                    return
+                if not chunk:
+                    break
+                if job.received + len(chunk) > limit:
+                    failed = (_("The server sent far more data than expected."),
+                              f"more than {limit} bytes without a Content-Length")
+                    break
+                handle.write(chunk)
+                job.received += len(chunk)
+                if job.received - checked >= SPACE_CHECK_EVERY:
+                    checked = job.received
+                    free = shutil.disk_usage(folder_fd).free
+                    if free < FREE_SPACE_RESERVE:
+                        failed = (_("There is not enough space left on your device."),
+                                  f"{free} bytes free after {job.received} bytes")
                         break
-                    try:
-                        chunk = response.read(256 * 1024)
-                    except (OSError, http.HttpError) as error:
-                        reason, detail = http.describe_error(error, episode.media_url)
-                        self.library.download_failed(episode.id, _("The server connection was lost before "
-                                                                   "completing the download"), detail, job.manual)
-                        return
-                    if not chunk:
-                        break
-                    if job.received + len(chunk) > limit:
-                        failed = (_("The server sent far more data than expected."),
-                                  f"more than {limit} bytes without a Content-Length")
-                        break
-                    handle.write(chunk)
-                    job.received += len(chunk)
-                    if job.received - checked >= SPACE_CHECK_EVERY:
-                        checked = job.received
-                        free = shutil.disk_usage(part.parent).free
-                        if free < FREE_SPACE_RESERVE:
-                            failed = (_("There is not enough space left on your device."),
-                                      f"{free} bytes free after {job.received} bytes")
-                            break
-                    now = time.monotonic()
-                    if now - job.last_emit > 0.25:
-                        job.last_emit = now
-                        bus.emit("download-progress", episode.id, job.received, job.total)
+                now = time.monotonic()
+                if now - job.last_emit > 0.25:
+                    job.last_emit = now
+                    bus.emit("download-progress", episode.id, job.received, job.total)
+            handle.flush()
         if job.cancelled or failed:
-            part.unlink(missing_ok=True)
+            discard()
             if failed:
                 self.library.download_failed(episode.id, *failed, job.manual)
             return
@@ -259,14 +298,14 @@ class DownloadManager:
                                                        "download"), f"{job.received} of {offset + length} bytes",
                                          job.manual)
             return
-        target = self._target_path(episode, feed, mime)
+        name = self._target_name(folder_fd, episode, mime)
         try:
-            os.replace(part, target)
+            os.replace(part, name, src_dir_fd=folder_fd, dst_dir_fd=folder_fd)
         except OSError as error:
-            part.unlink(missing_ok=True)
+            discard()
             self.library.download_failed(episode.id, *http.describe_error(error), job.manual)
             return
-        self.library.download_finished(episode.id, target, job.received, job.manual)
+        self.library.download_finished(episode.id, folder / name, job.received, job.manual)
 
 
 def files_size(paths):

@@ -8,8 +8,11 @@ in a separate file with mode 0600.
 
 import contextlib
 import copy
+import errno
 import json
 import os
+import secrets
+import shutil
 import stat
 import tempfile
 import threading
@@ -232,7 +235,7 @@ def _atomic_write(path, text, mode=0o600):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
-        os.chmod(tmp, mode)
+            os.fchmod(handle.fileno(), mode)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -527,20 +530,262 @@ def owns_file(path, feed_url):
     return is_download(path)
 
 
+# Folders other people may be able to write
+#
+# An export folder, a download folder the user chose and the folder downloads move to can be shared ones, which
+# another account may write too. Whoever can write a folder can put a symbolic link under any name in it, at any
+# moment: a file that omaPOD opens, truncates, renames or deletes *by its name* there may by then be a link to one
+# of the user's other files. So in these folders the folder is opened once and everything else happens relative to
+# that open folder and through files that are already open, without following links.
+
+_FOLDER = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+_NEW_FILE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+COPY_CHUNK = 1024 * 1024
+
+
+def _new_file(folder_fd, mode, prefix=".omapod-", suffix=".tmp"):
+    """A new, empty file under a random name in an open folder: (name, descriptor). O_EXCL never opens what is
+    there already, be it a file or a link."""
+    for _attempt in range(100):
+        name = f"{prefix}{secrets.token_hex(8)}{suffix}"
+        try:
+            return name, os.open(name, _NEW_FILE, mode, dir_fd=folder_fd)
+        except FileExistsError:
+            continue
+    raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), prefix + "*" + suffix)
+
+
+def others_can_change(path):
+    """Whether an account other than the user's (root aside) can change which file `path` leads to. That is so
+    when a folder on the way to it belongs to somebody else or can be written by its group or by everyone (a
+    sticky folder like /tmp aside, where everybody can rename only what is theirs): such an account can rename
+    what lies in that folder and put a link to another place under the name, at any moment, so that a check of
+    where the path leads means nothing a moment later. The way is walked as the system walks it, through every
+    folder a symbolic link on it leads through. What cannot be examined counts as changeable. Where this is
+    False, nobody else can interfere, and the file may be handled by its path."""
+    me = os.getuid()
+
+    def changeable(folder):
+        info = os.lstat(folder)
+        return (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, me)
+                or bool(info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX))
+
+    parts = os.path.dirname(os.path.abspath(path)).split(os.sep)
+    current, links = os.sep, 0
+    try:
+        if changeable(current):
+            return True
+        while parts:
+            part = parts.pop(0)
+            if part in ("", "."):
+                continue
+            if part == "..":
+                current = os.path.dirname(current)  # examined on the way down
+                continue
+            step = os.path.join(current, part)
+            info = os.lstat(step)
+            if stat.S_ISLNK(info.st_mode):
+                links += 1
+                if links > 40 or info.st_uid not in (0, me):  # in a sticky folder, its owner can replace it
+                    return True
+                target = os.readlink(step)
+                if target.startswith(os.sep):
+                    current = os.sep
+                parts = target.split(os.sep) + parts
+            elif changeable(step):
+                return True
+            else:
+                current = step
+    except OSError:
+        return True
+    return False
+
+
 @contextlib.contextmanager
 def private_file(path):
-    """For a file the user exports: a new file that only the owner can read from the start (mkstemp creates it
-    with 0600) and that replaces `path` once it is complete. Yields its path. Nobody else can open it while it is
-    written, and whoever had an old file at `path` open keeps only the old content."""
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".omapod-", suffix=".tmp")
-    os.close(fd)
+    """For a file the user exports: yields a new file, open for writing bytes, that only the owner can read from
+    the start (0600) and that replaces `path` once it is complete. Whoever had an old file at `path` open keeps
+    only the old content.
+
+    Everything is written through this one open file, which is never opened again by a name: in a folder another
+    account can write, a link could wait under the name by then, and the export would go through it into one of
+    the user's other files, or into a file the other account can read. The folder is opened once; the file is
+    created, renamed and (when writing fails) removed relative to it."""
+    folder, name = os.path.split(os.path.abspath(path))
+    folder_fd = os.open(folder, _FOLDER)
     try:
-        yield tmp
-        os.replace(tmp, path)
-    except BaseException:
-        for leftover in (tmp, tmp + "-journal"):
+        tmp, fd = _new_file(folder_fd, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                yield handle
+            os.replace(tmp, name, src_dir_fd=folder_fd, dst_dir_fd=folder_fd)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp, dir_fd=folder_fd)
+            raise
+    finally:
+        os.close(folder_fd)
+
+
+def copy_regular_file(path, target, limit):
+    """Copies the file the user chose (`path`) into the open file `target`, at most `limit` bytes. Only a regular
+    file: a pipe or a device under that name would block or never end, and the folder may be anyone's. Raises
+    ValueError with a text for the user otherwise."""
+    from .i18n import _
+
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)  # O_NONBLOCK: a pipe would wait for a writer
+    with os.fdopen(fd, "rb") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(_("This is not a regular file."))
+        copied = 0
+        while info.st_size <= limit:
+            chunk = source.read(COPY_CHUNK)
+            if not chunk:
+                return
+            copied += len(chunk)
+            if copied > limit:  # more than its size said: it grew while it was read
+                break
+            target.write(chunk)
+        raise ValueError(_("This file is too large."))
+
+
+def open_podcast_folder(name, create=False, root=None):
+    """A podcast's folder in the download folder (<download folder>/<name>), opened: a descriptor the caller
+    closes. Files in it are then created, renamed and deleted relative to the descriptor. The podcast's folder
+    must be a real folder, not a symbolic link (NotADirectoryError): through a link, downloads would land in, and
+    be deleted from, wherever it points. The download folder itself is taken as the user named it.
+    `root`: another download folder than the current one (the one downloads move to)."""
+    if not name or name in (".", "..") or os.sep in name:
+        raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), name)
+    root = str(downloads_dir() if root is None else root)
+    if create:
+        os.makedirs(root, exist_ok=True)
+    root_fd = os.open(root, _FOLDER)
+    try:
+        if create:
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(name, dir_fd=root_fd)
+        return os.open(name, _FOLDER | os.O_NOFOLLOW, dir_fd=root_fd)
+    finally:
+        os.close(root_fd)
+
+
+@contextlib.contextmanager
+def opened_download(path):
+    """To delete or move the download `path` names: yields (descriptor of its podcast's folder, file name), or
+    None when omaPOD may not touch it (is_download). The folder is opened from the download folder down, without
+    following a link, and the file is addressed relative to it: whatever another account does in the download
+    folder between the check and the deletion, nothing outside <download folder>/<podcast>/ is reached."""
+    if not is_download(path):
+        yield None
+        return
+    parent, name = os.path.split(os.path.abspath(path))
+    try:
+        folder_fd = open_podcast_folder(os.path.basename(parent))
+    except OSError:
+        yield None
+        return
+    try:
+        yield folder_fd, name
+    finally:
+        os.close(folder_fd)
+
+
+def remove_download(path):
+    """Deletes the download `path` names. False when it is not a download (is_download) and stays where it is."""
+    with opened_download(path) as download:
+        if download is None:
+            return False
+        folder_fd, name = download
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name, dir_fd=folder_fd)
+        return True
+
+
+def name_taken(folder_fd, name):
+    """Whether anything has this name in the open folder, a link that leads nowhere included."""
+    try:
+        os.stat(name, dir_fd=folder_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def open_partial(folder_fd, name):
+    """The file a download is written to until it is complete (<podcast's folder>/.<episode>.part), opened for
+    reading and writing bytes; created if it is not there, kept if it is (the download resumes).
+
+    Its name can be guessed, so somebody else could have put something there first. It is opened without
+    following a link and has to be a plain file with this one name. Anything else (a link, a pipe, a second name
+    of another file, a file omaPOD may not write) is not written to; it loses the name, which is omaPOD's, and a
+    new file takes it."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags, 0o666, dir_fd=folder_fd)
+    except OSError as error:
+        if error.errno not in (errno.ELOOP, errno.ENXIO, errno.EACCES):  # a link, a socket, somebody else's file
+            raise
+    else:
+        info = os.fstat(fd)
+        if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            return os.fdopen(fd, "r+b")
+        os.close(fd)
+    os.unlink(name, dir_fd=folder_fd)
+    return os.fdopen(os.open(name, flags | os.O_EXCL, 0o666, dir_fd=folder_fd), "r+b")
+
+
+def is_same_file(folder_fd, name, handle):
+    """Whether `name` in the open folder is (still) the open file `handle`."""
+    try:
+        there, ours = os.stat(name, dir_fd=folder_fd, follow_symlinks=False), os.fstat(handle.fileno())
+    except OSError:
+        return False
+    return (there.st_dev, there.st_ino) == (ours.st_dev, ours.st_ino)
+
+
+def move_into(source_fd, name, target_fd):
+    """Moves the file `name` from one open folder into another and returns the name it has there: its own, or
+    "name (2).ext" and so on when that is taken. It never replaces what is there and never follows a link: the
+    move is a second name for the file in the new folder (which fails if the name is taken, whatever has it) and
+    the loss of the old one. Across file systems, and on those without such second names, the content is copied
+    into a file created anew (O_EXCL). Only regular files move."""
+    if not stat.S_ISREG(os.stat(name, dir_fd=source_fd, follow_symlinks=False).st_mode):
+        raise OSError(errno.EINVAL, os.strerror(errno.EINVAL), name)
+    stem, suffix = os.path.splitext(name)
+    for counter in range(1, 10000):
+        new_name = name if counter == 1 else f"{stem} ({counter}){suffix}"
+        try:
             try:
-                os.unlink(leftover)
-            except OSError:
-                pass
-        raise
+                os.link(name, new_name, src_dir_fd=source_fd, dst_dir_fd=target_fd, follow_symlinks=False)
+            except FileExistsError:
+                continue
+            except OSError:  # another file system, or one without hard links
+                _copy_into(source_fd, name, target_fd, new_name)
+        except FileExistsError:
+            continue
+        try:
+            os.unlink(name, dir_fd=source_fd)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(new_name, dir_fd=target_fd)  # not moved after all: it stays where it was, once
+            raise
+        return new_name
+    raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), name)
+
+
+def _copy_into(source_fd, name, target_fd, new_name):
+    with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=source_fd), "rb") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(errno.EINVAL, os.strerror(errno.EINVAL), name)
+        fd = os.open(new_name, _NEW_FILE, 0o666, dir_fd=target_fd)
+        try:
+            with os.fdopen(fd, "wb") as target:
+                shutil.copyfileobj(source, target, COPY_CHUNK)
+                target.flush()
+                os.utime(target.fileno(), ns=(info.st_atime_ns, info.st_mtime_ns))
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(new_name, dir_fd=target_fd)
+            raise

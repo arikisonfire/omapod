@@ -24,22 +24,25 @@ def _apply_pending_import():
         import sqlite3
 
         from .config import private_file
+        from .db import write_snapshot
 
         backup = str(paths.db) + time.strftime(".before-import-%Y%m%d-%H%M%S")
         # Private from its first byte, like every copy of the library (config.private_file).
-        with private_file(backup) as path:
+        with private_file(backup) as handle:
             try:
                 # Through SQLite, so the copy includes what is still in the write-ahead log (deleted below).
-                current, copy = sqlite3.connect(paths.db), sqlite3.connect(path)
+                current = sqlite3.connect(paths.db)
                 try:
-                    current.backup(copy)
+                    write_snapshot(current, handle, paths.data)
                 finally:
-                    copy.close()
                     current.close()
             except sqlite3.Error:
                 import shutil
 
-                shutil.copyfile(paths.db, path)
+                handle.seek(0)
+                handle.truncate()
+                with open(paths.db, "rb") as source:
+                    shutil.copyfileobj(source, handle)
     for suffix in ("-wal", "-shm"):
         try:
             os.unlink(str(paths.db) + suffix)
@@ -186,10 +189,19 @@ def main(argv=None):
     if app.restart_requested:
         # Only now, after do_shutdown stopped mpv and closed the database: a database import is swapped in at the
         # start (see _apply_pending_import).
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        env = dict(os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", ""))
-        os.execve(sys.executable, [sys.executable, "-P", "-m", "omapod"], env)  # -P: as the launchers start it
+        os.execve(sys.executable, *_restart_command())
     return code
+
+
+def _restart_command(environ=None):
+    """(arguments, environment) to start omaPOD again as the launchers start it: with -P, so the working
+    directory is not on Python's module path. An empty entry in PYTHONPATH means the working directory too, so
+    none is passed on: a file there named like a module (json.py) would run in place of it."""
+    environ = dict(os.environ if environ is None else environ)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    entries = [root] + [entry for entry in environ.get("PYTHONPATH", "").split(os.pathsep) if entry and entry != root]
+    environ["PYTHONPATH"] = os.pathsep.join(entries)
+    return [sys.executable, "-P", "-m", "omapod"], environ
 
 
 if __name__ == "__main__":

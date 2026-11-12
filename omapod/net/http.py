@@ -240,12 +240,16 @@ def describe_certificate(der):
     info = {"sha256": digest, "fingerprint": ":".join(digest[i:i + 2] for i in range(0, 64, 2)).upper(),
             "subject": "", "issuer": "", "expires": 0}
     try:
-        # ssl only decodes certificates it has verified; this helper reads any PEM file.
+        # ssl only decodes certificates it has verified; this helper reads any PEM file, by its name. The file is
+        # made in omaPOD's own cache folder, not in the shared /tmp: the names shown next to the fingerprint must
+        # be those of this certificate, whoever else can write the folder for temporary files.
         import _ssl
         import os
         import tempfile
 
-        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as handle:
+        from ..config import paths
+
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False, dir=paths.cache) as handle:
             handle.write(ssl.DER_cert_to_PEM_cert(der))
         try:
             decoded = _ssl._test_decode_cert(handle.name)

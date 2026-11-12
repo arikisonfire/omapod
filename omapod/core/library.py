@@ -9,14 +9,14 @@ them: the UI, the player, the bar plugin or the headless refresh.
 import os
 import random
 import re
-import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from ..config import chosen_folder, owns_file, trust_folder, trusted_folders
+from ..config import (chosen_folder, move_into, open_podcast_folder, opened_download, others_can_change, owns_file,
+                      remove_download, trust_folder, trusted_folders)
 from ..events import bus
 from ..feeds import chapters as chapter_utils
 from ..feeds.parser import FeedParseError, NotAFeedError, parse_feed
@@ -958,7 +958,7 @@ class Library:
         episode = self.db.get_episode(episode_id, full=False)
         if episode is None:
             try:
-                os.unlink(path)
+                remove_download(str(path))  # the episode went meanwhile, and its download with it
             except OSError:
                 pass
             return
@@ -990,15 +990,13 @@ class Library:
     def _remove_file(self, episode):
         """Deletes the file of a download, but only a file in the download folder (config.is_download): the
         database names it, and an imported backup could name any of the user's files. Returns False when such a
-        file stays where it is."""
+        file stays where it is. The file is deleted relative to its opened folder (config.remove_download), so a
+        link put into the download folder meanwhile cannot lead the deletion elsewhere."""
         if not episode.file_path or episode.is_local:
             return True
-        if not owns_file(episode.file_path, episode.feed_url):
-            return not os.path.lexists(episode.file_path)
         try:
-            os.unlink(episode.file_path)
-        except FileNotFoundError:
-            pass
+            if not remove_download(episode.file_path):
+                return not os.path.lexists(episode.file_path)
         except OSError as error:
             bus.emit("message", str(error), "error")
         return True
@@ -1009,12 +1007,12 @@ class Library:
         allow_local = local_files or (quiet and bool(self.settings.get("auto_delete_local")))
         episodes = [e for e in self.db.get_episodes_by_ids(ids) if e.is_downloaded and (allow_local or not e.is_local)]
         current = self.current_episode_id()
-        deleted, kept = [], []
+        deleted, kept, shared = [], [], []
         for episode in episodes:
             if episode.id == current and self.player and stop_player:
                 self.player.stop()
             if episode.is_local:
-                if not self._trash_local(episode):
+                if not self._trash_local(episode, shared):
                     continue
                 self.db.execute("DELETE FROM episodes WHERE id = ?", (episode.id,))
             else:
@@ -1028,6 +1026,11 @@ class Library:
                 "{file} is not in the download folder, so omaPOD left it where it is.",
                 "{n} files are not in the download folder, so omaPOD left them where they are.",
                 len(kept)).format(file=os.path.basename(kept[0]), n=len(kept)), "info")
+        if shared and not quiet:
+            bus.emit("message", ngettext(
+                "{file} is in a folder that other accounts can change, so omaPOD left it where it is.",
+                "{n} files are in folders that other accounts can change, so omaPOD left them where they are.",
+                len(shared)).format(file=os.path.basename(shared[0]), n=len(shared)), "info")
         if not deleted:
             return 0
         if self.settings.get("delete_removes_from_queue"):
@@ -1040,10 +1043,17 @@ class Library:
                                          len(deleted)).format(n=len(deleted)), "info")
         return len(deleted)
 
-    def _trash_local(self, episode):
-        """Moves a file of an added folder to the trash; one outside that folder stays (config.owns_file)."""
+    def _trash_local(self, episode, shared):
+        """Moves a file of an added folder to the trash and returns True. A file outside that folder stays and is
+        only forgotten (config.owns_file). False when the file stays, and its episode with it: the trash refused
+        it, or its folder is one that other accounts can change. There the path could lead to another of the
+        user's files by the time the file is moved (a link in place of a folder on the way), and the trash works
+        by path; such files are added to `shared`."""
         if not owns_file(episode.file_path, episode.feed_url):
             return True
+        if others_can_change(episode.file_path):
+            shared.append(episode.file_path)
+            return False
         try:
             if os.path.lexists(episode.file_path):
                 move_to_trash(episode.file_path)
@@ -1217,29 +1227,34 @@ class Library:
     # ------------------------------------------------------------ storage
 
     def move_downloads(self, new_dir):
-        """Move every downloaded file into a new downloads folder."""
+        """Move every downloaded file into a new downloads folder. The new folder may be one that other accounts
+        write too: files move from and into opened folders, never onto something that is there and never through
+        a symbolic link (config.move_into)."""
         new_dir = Path(new_dir).expanduser()
         new_dir.mkdir(parents=True, exist_ok=True)
         moved = 0
         for episode in self.db.get_episodes(("downloaded",)):
-            if episode.is_local or not owns_file(episode.file_path, episode.feed_url):
-                continue  # files elsewhere are not omaPOD's to move (see _remove_file)
-            source = Path(episode.file_path)
-            target_folder = new_dir / source.parent.name
-            target_folder.mkdir(parents=True, exist_ok=True)
-            target = target_folder / source.name
-            if target == source:
-                continue  # the same folder
-            counter = 2
-            while os.path.lexists(target):  # the new folder may hold a file of that name: never replace it
-                target = target_folder / f"{source.stem} ({counter}){source.suffix}"
-                counter += 1
-            try:
-                shutil.move(str(source), str(target))
-                self.db.update_episode(episode.id, file_path=str(target))
-                moved += 1
-            except OSError:
+            if episode.is_local:
                 continue
+            podcast = os.path.basename(os.path.dirname(episode.file_path))
+            with opened_download(episode.file_path) as download:
+                if download is None:
+                    continue  # files elsewhere are not omaPOD's to move (see _remove_file)
+                source_fd, name = download
+                try:
+                    target_fd = open_podcast_folder(podcast, create=True, root=new_dir)
+                except OSError:
+                    continue  # a link or a file has the podcast's name there: the download stays where it is
+                try:
+                    if os.path.sameopenfile(source_fd, target_fd):
+                        continue  # the same folder
+                    new_name = move_into(source_fd, name, target_fd)
+                except OSError:
+                    continue
+                finally:
+                    os.close(target_fd)
+            self.db.update_episode(episode.id, file_path=str(new_dir / podcast / new_name))
+            moved += 1
         self.settings.set("downloads_dir", str(new_dir))
         bus.emit("downloads-changed")
         return moved

@@ -27,15 +27,21 @@ files that hold personal data or secrets with mode 0600.
 
 Database exports and backups contain the passwords of protected podcasts, so a restored library keeps working.
 Keep them as private as the passwords themselves. omaPOD creates every export (database, OPML, HTML) readable
-by your user only (0600) before it writes the first byte, and puts it in place once it is complete.
+by your user only (0600) before it writes the first byte, and puts it in place once it is complete. The export
+is written through the one file omaPOD created and holds open, never through a name it opens a second time: in
+a folder that other accounts can write, a link could have taken the name by then (see
+[Folders you share](#folders-you-share)). The database copy is made by SQLite inside omaPOD's own data folder
+and goes from there into that file.
 
-**Importing a database** replaces the library with a file that may come from anywhere. omaPOD reads it with
-SQLite's precautions for untrusted files and accepts it only if it passes the integrity check and holds nothing
-but tables and indexes (no triggers, views or virtual tables). Downloads it lists that are not in your download
-folder are forgotten, so the import cannot point omaPOD at your other files. If you chose a download folder of
-your own, which may hold other files too, the import keeps only the downloads your current library already has.
-Podcasts of local folders come along with their history, but not the permission to use their folders (see
-[Your files](#your-files)).
+**Importing a database** replaces the library with a file that may come from anywhere. omaPOD first copies the
+file into its own data folder (only a regular file, not a pipe or a device) and works on that copy, so the
+file cannot change after the check, and SQLite neither trusts nor creates anything next to the file you chose.
+It reads the copy with SQLite's precautions for untrusted files and accepts it only if it passes the integrity
+check and holds nothing but tables and indexes (no triggers, views or virtual tables). Downloads it lists that
+are not in your download folder are forgotten, so the import cannot point omaPOD at your other files. If you
+chose a download folder of your own, which may hold other files too, the import keeps only the downloads your
+current library already has. Podcasts of local folders come along with their history, but not the permission
+to use their folders (see [Your files](#your-files)).
 
 ## Network connections
 
@@ -109,6 +115,30 @@ them alone, and automatic deletion skips them unless you switch on **Auto delete
 go to the trash too). Only audio and video files inside a folder you chose go to the trash, and which files those
 are omaPOD learns from the folder itself, not from its database. Pictures on your disk are read only as covers
 of these folders.
+
+The permission is for the folder's path. If another account can change a folder on the way to it (the folder
+lies in a shared place, or it is writable for a group or for everyone), that account can make the path lead to
+another of your folders. omaPOD still plays what it finds there, but it moves nothing to the trash in such a
+place, whatever the settings say: it says so and leaves the file where it is.
+
+## Folders you share
+
+The folder you export to, a download folder you chose and the folder you move your downloads to may be folders
+that other accounts on the computer can write as well (a shared media folder, say). Whoever can write a folder
+can put a symbolic link under any name in it at any moment, so in these folders omaPOD does not trust names
+(for folders you added as podcasts, see [Your files](#your-files)):
+
+- It opens the folder once and creates, renames and deletes files relative to that open folder.
+- It writes only through files it created or opened itself, and it opens them without following a link. The
+  unfinished download `.<number>.part`, whose name can be guessed, must be a plain file with that one name;
+  a link, a pipe or a second name of another file loses the name, and a new file takes it.
+- A podcast's folder inside the download folder must be a real folder. If a link has its name, omaPOD does not
+  download into it, and files reached through it are not its downloads (they are never deleted or moved).
+- Moving downloads never replaces a file and never follows a link in the new folder: a download gets a free
+  name there, and across file systems it is copied into a newly created file.
+
+Another account that can write such a folder can still delete or replace the files in it; that is what sharing
+the folder means. It cannot use omaPOD to reach your files outside of it.
 
 ## Limits by design
 

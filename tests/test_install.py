@@ -114,6 +114,31 @@ class LaunchersTest(unittest.TestCase):
         self.assertIn("python3 -P - <<'PY'", installer)
         self.assertIn('[sys.executable, "-P", "-m", "omapod"]', (ROOT / "omapod" / "__main__.py").read_text())
 
+    def test_a_restart_keeps_the_working_directory_off_the_module_path(self):
+        """After a database import omaPOD starts itself again. An empty entry in PYTHONPATH stands for the working
+        directory, -P or not; the restart used to add one whenever the variable was not set."""
+        import os
+
+        from omapod.__main__ import _restart_command
+
+        for value in (None, "", os.pathsep, f"/opt/modules{os.pathsep}", f"{os.pathsep}/opt/modules",
+                      f"{ROOT}{os.pathsep}{os.pathsep}/opt/modules"):
+            with self.subTest(value=value):
+                arguments, environ = _restart_command({} if value is None else {"PYTHONPATH": value, "HOME": "/h"})
+                entries = environ["PYTHONPATH"].split(os.pathsep)
+                self.assertEqual(arguments[1:], ["-P", "-m", "omapod"])
+                self.assertEqual(entries[0], str(ROOT))
+                self.assertNotIn("", entries)
+                self.assertEqual(entries.count(str(ROOT)), 1)
+                self.assertEqual("/opt/modules" in entries, "/opt/modules" in (value or ""))
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "json.py").write_text("open(__file__ + '.ran', 'w').close()\n")
+            arguments, environ = _restart_command({"PATH": os.environ.get("PATH", ""), "PYTHONDONTWRITEBYTECODE": "1"})
+            done = subprocess.run(arguments + ["--version"], cwd=folder, env=environ, capture_output=True, text=True,
+                                  timeout=60)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertFalse(Path(folder, "json.py.ran").exists())
+
     def test_a_module_in_the_working_directory_does_not_run(self):
         import os
 

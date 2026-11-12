@@ -11,6 +11,8 @@ from ...net import http, search
 from ..widgets.common import Cover, Debouncer, label
 from .base import BasePage
 
+MAX_OPML_BYTES = 64 * 1024 * 1024  # as much as a feed may have
+
 COUNTRIES = ["us", "gb", "de", "at", "ch", "fr", "nl", "es", "it", "se", "dk", "no", "fi", "pl", "ie", "ca", "au",
              "nz", "br", "mx", "jp", "in"]
 
@@ -265,10 +267,21 @@ class AddPage(BasePage):
         dialog.select_folder(self.ctx.window, None, done)
 
 
+def read_opml_file(path):
+    """The podcasts an OPML file lists. Only a regular file of a sane size is read: the name can come from a file
+    manager or a link (omapod FILE), and a pipe or a device under it would block omaPOD or fill its memory."""
+    import io
+
+    from ...config import copy_regular_file
+
+    content = io.BytesIO()
+    copy_regular_file(path, content, MAX_OPML_BYTES)
+    return parse_opml(content.getvalue())
+
+
 def import_opml_file(ctx, path):
     try:
-        with open(path, "rb") as handle:
-            entries = parse_opml(handle.read())
+        entries = read_opml_file(path)
     except (OSError, ValueError, Exception):
         ctx.toast(_("An error has occurred while reading the file. Make sure that it is a valid OPML file."), 6)
         return
