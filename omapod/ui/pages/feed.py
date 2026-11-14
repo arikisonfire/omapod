@@ -196,8 +196,11 @@ class FeedPage(EpisodeListPage):
         from ..dialogs import text_prompt
 
         def apply(value):
-            if not self.ctx.library.edit_feed_url(self.feed_id, value.strip()):
-                self.ctx.toast(_("That address is already used by another podcast."))
+            try:
+                if not self.ctx.library.edit_feed_url(self.feed_id, value.strip()):
+                    self.ctx.toast(_("That address is already used by another podcast."))
+            except ValueError as error:
+                self.ctx.toast(str(error), 6)
 
         text_prompt(self.ctx.window, _("Edit feed URL"), self.feed.url, _("Change"), apply,
                     body=_("Changing the RSS address can break the playback state and episode list of this "

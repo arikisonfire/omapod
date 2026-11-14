@@ -12,6 +12,7 @@ from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 from ..i18n import _
 from ..net import http
+from ..util import plain_address, scrub_logins
 
 UPLOAD_BULK_SIZE = 30
 
@@ -38,14 +39,16 @@ class ActionChanges:
 
 
 def normalize_host(host, default="gpodder.net"):
-    """AntennaPod's HostnameParser: 'host', 'host:port/sub', 'http(s)://...' -> base URL without slash."""
+    """Like AntennaPod's HostnameParser: 'host', 'host:port/sub', 'http(s)://...' -> base URL without slash.
+    Unlike it, an address without a scheme always means https, whatever its port: 'host:80' is not quietly
+    reached over http, where the login travels in plain text. That takes a typed http://, or the user's yes
+    (PlainHttpOnly). A login written into the address is left out; the login is asked for separately."""
     host = (host or default).strip()
-    match = re.match(r"^(?:(https?)://)?([^:/]+)(?::(\d+))?(.*)?$", host)
+    match = re.match(r"^(?:(https?)://)?(?:[^/?#]*@)?([^:/]+)(?::(\d+))?(.*)?$", host, re.I)
     if not match:
         return "https://" + host.rstrip("/")
     scheme, name, port, sub = match.groups()
-    if scheme is None:
-        scheme = "http" if port == "80" else "https"
+    scheme = (scheme or "https").lower()
     try:
         name = name.encode("idna").decode("ascii")
     except UnicodeError:
@@ -103,12 +106,21 @@ def _stamp(value):
 
 
 def _actions(data):
-    """Episode actions as the API describes them. Anything else is left out instead of stopping the sync."""
+    """Episode actions as the API describes them. Anything else is left out instead of stopping the sync.
+    Their addresses are taken without a login (another app may have sent one along): that is how this library
+    keeps addresses, so that is how they match, and how they are remembered."""
     actions = data.get("actions")
     if not isinstance(actions, list):
         return []
-    return [a for a in actions if isinstance(a, dict) and isinstance(a.get("episode"), str)
-            and isinstance(a.get("podcast", ""), str) and isinstance(a.get("guid") or "", str)]
+    result = []
+    for action in actions:
+        if (isinstance(action, dict) and isinstance(action.get("episode"), str)
+                and isinstance(action.get("podcast", ""), str) and isinstance(action.get("guid") or "", str)):
+            action = dict(action, episode=plain_address(action["episode"]))
+            if "podcast" in action:
+                action["podcast"] = plain_address(action["podcast"])
+            result.append(action)
+    return result
 
 
 class GpodderNet:
@@ -137,7 +149,8 @@ class GpodderNet:
         data = b"" if method == "POST" else None
         headers = {"Accept": "application/json"}
         if payload is not None:
-            data = json.dumps(payload).encode("utf-8")
+            # scrub_logins: whatever the caller hands over, no address in it leaves with a login.
+            data = json.dumps(scrub_logins(payload)).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=utf-8"
         try:
             response = http.request(url, method=method, data=data, headers=headers, auth=self._auth,
@@ -229,7 +242,7 @@ class Nextcloud:
         data = None
         headers = {"Accept": "application/json", "OCS-APIRequest": "true"}
         if payload is not None:
-            data = json.dumps(payload).encode("utf-8")
+            data = json.dumps(scrub_logins(payload)).encode("utf-8")  # see GpodderNet._request
             headers["Content-Type"] = "application/json"
         try:
             return http.request(url, method=method, data=data, headers=headers, auth=self._auth,
@@ -273,7 +286,7 @@ class Nextcloud:
     def put_shared(self, name, data, etag=""):
         """Writes a shared file unless another computer changed it since `etag` was read.
         Returns the new ETag ("" if the server sent none), or None when the file had changed."""
-        body = json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
+        body = json.dumps(scrub_logins(data), ensure_ascii=False, indent=1).encode("utf-8")
         headers = {"Content-Type": "application/json", **({"If-Match": etag} if etag else {"If-None-Match": "*"})}
         for attempt in (1, 2):
             try:
@@ -294,6 +307,15 @@ class Nextcloud:
 
     def logout(self):
         pass
+
+    def revoke(self):
+        """Asks the Nextcloud to forget this app password: a login the user did not go through with. True if it
+        did."""
+        try:
+            self._dav_request(f"{self.base}/ocs/v2.php/core/apppassword", method="DELETE")
+        except http.HttpError:
+            return False
+        return True
 
     def get_subscription_changes(self, since):
         data = _object(self._request(self._url("/subscriptions", since=int(since))))
@@ -338,6 +360,20 @@ class PlainHttpOnly(SyncError):
         self.private = is_private_host(urlsplit(server).hostname)
 
 
+def https_upgrade(server):
+    """The https address of a sync server stored with http://, "" when there is none to try: the server is
+    stored with https already, or with a port of its own, whose https port nobody knows."""
+    try:
+        parts = urlsplit(server)
+        port = parts.port
+    except ValueError:
+        return ""
+    if parts.scheme.lower() != "http" or not parts.hostname or port not in (None, 80) or "@" in parts.netloc:
+        return ""
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    return f"https://{host}{parts.path.rstrip('/')}"
+
+
 def is_private_host(host):
     """Whether every address of host stays in a local network or VPN (private ranges, loopback, link-local, the
     100.64/10 range Tailscale uses), where plain http can be acceptable."""
@@ -376,7 +412,8 @@ class NextcloudLoginFlow:
             except http.HttpError as plain_error:
                 raise SyncError(_explain(error) + "\n\n" + _explain(plain_error)) from None
             # Never silently: the app password would then travel in plain text, and an attacker in the network
-            # can make TLS fail on purpose.
+            # can make TLS fail on purpose. What the server answered over http is not kept: this login is over.
+            self.login_url = self.token = self.endpoint = ""
             raise PlainHttpOnly(plain) from None
 
     def _start(self, server):

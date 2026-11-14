@@ -153,7 +153,10 @@ Panel {
 
   function handleLine(line) {
     var msg
+    // omaPOD sends short lines (names are clipped, no addresses). Anything else is not from it.
+    if (line.length > 65536) return
     try { msg = JSON.parse(line) } catch (e) { return }
+    if (msg === null || typeof msg !== "object") return
     if (msg.type === "state") {
       root.st = msg
       root.episode = msg.episode || null
@@ -434,6 +437,7 @@ Panel {
             visible: !root.connected
 
             Text {
+              textFormat: Text.PlainText
               text: root.installed ? "omaPOD is not running" : "omaPOD is not installed"
               color: root.fg
               font.family: root.fontFamily
@@ -441,6 +445,7 @@ Panel {
               font.bold: true
             }
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               wrapMode: Text.WordWrap
               text: root.installed
@@ -470,6 +475,7 @@ Panel {
             visible: root.connected && !root.hasEpisode
 
             Text {
+              textFormat: Text.PlainText
               text: "Nothing playing"
               color: root.fg
               font.family: root.fontFamily
@@ -477,6 +483,7 @@ Panel {
               font.bold: true
             }
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               wrapMode: Text.WordWrap
               text: (root.st.queue_count || 0) > 0
@@ -635,12 +642,14 @@ Panel {
 
               Text {
                 id: elapsed
+                textFormat: Text.PlainText
                 text: root.clock(root.livePosition)
                 color: root.dimFg
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
               Text {
+                textFormat: Text.PlainText
                 anchors.right: parent.right
                 text: root.duration > 0 ? "−" + root.clock(root.duration - root.livePosition) : ""
                 color: root.dimFg

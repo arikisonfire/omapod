@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from ..config import (chosen_folder, move_into, open_podcast_folder, opened_download, others_can_change, owns_file,
-                      remove_download, trust_folder, trusted_folders)
+from ..config import (SHARED_SYNC_RESET, chosen_folder, move_into, open_podcast_folder, opened_download,
+                      others_can_change, owns_file, remove_download, trust_folder, trusted_folders)
 from ..events import bus
 from ..feeds import chapters as chapter_utils
 from ..feeds.parser import FeedParseError, NotAFeedError, parse_feed
@@ -24,7 +24,7 @@ from ..i18n import _, ngettext
 from ..models import (ACTION_GLOBAL, ACTION_INBOX, ACTION_NOTHING, ACTION_QUEUE, AUDIO_EXTENSIONS, FEED_ARCHIVED,
                       FEED_PREVIEW, FEED_SUBSCRIBED, LOCAL_PREFIX, NEW, PLAYED, UNPLAYED, VIDEO_EXTENSIONS)
 from ..net import http
-from ..util import now_ms, now_s
+from ..util import now_ms, now_s, plain_address, split_login, sync_address, sync_feed_address
 
 ACTION_CODES = {"inbox": ACTION_INBOX, "queue": ACTION_QUEUE, "nothing": ACTION_NOTHING}
 
@@ -118,6 +118,11 @@ class Library:
         self._feed_locks = {}
         self.refreshing = False
         self.stopping = False  # the background refresh was asked to make way for the app
+        if getattr(db, "cleaned", 0):
+            # Opening the library took logins out of addresses (db.Database.take_logins_out_of_addresses), so the
+            # queue and favorites differ from what the last sync saw only in how they are written. The next sync
+            # combines both sides, as the first one does, instead of taking that for a change made here.
+            settings.update(SHARED_SYNC_RESET)
 
     # ------------------------------------------------------------ helpers
 
@@ -146,7 +151,8 @@ class Library:
     # ------------------------------------------------------------ sync queue hooks
 
     def sync_feed(self, url, added):
-        if not self.sync_enabled() or not url or url.startswith(LOCAL_PREFIX):
+        url = sync_feed_address(url)  # "" for a folder, and for anything that is not a plain web address
+        if not self.sync_enabled() or not url:
             return
         kind = "sub"
         for row_id, payload in self.db.sync_pending(kind):
@@ -160,9 +166,12 @@ class Library:
             return
         if episode.feed_url.startswith(LOCAL_PREFIX) or episode.feed_state == FEED_PREVIEW:
             return
+        podcast, media = sync_feed_address(episode.feed_url), sync_address(episode.media_url)
+        if not podcast or not media:
+            return  # not an address to tell a server (util.sync_address)
         payload = {
-            "podcast": episode.feed_url,
-            "episode": episode.media_url,
+            "podcast": podcast,
+            "episode": media,
             "action": action,
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
         }
@@ -191,7 +200,7 @@ class Library:
         """auth_url: the podcast's own address when fetching another one for it (its next pages). The password
         goes only to that address's server, never to another host, even one that asks for it. A 401 raises
         AuthRequired with the address that asked, which a redirect may have led to."""
-        auth = (username, password) if username else None
+        auth = (username, password) if username or password else None
         try:
             response = http.request(url, auth=auth, etag=etag, last_modified=last_modified, auth_url=auth_url,
                                     headers={"Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, "
@@ -211,16 +220,17 @@ class Library:
             url = "https://" + url
         # A login written into the address (https://user:password@host/feed) becomes the podcast's login. In the
         # address it would go wherever the address goes: to the sync server, into exports and the download log.
-        url, user, secret = http.split_userinfo(url)
-        if user and not username:
+        url, user, secret = split_login(url)
+        if (user or secret) and not (username or password):
             username, password = user, secret
         existing = self.db.get_feed_by_url(url)
         if existing is not None:
             return existing.id
         response = self.fetch(url, username, password)
         parsed = parse_feed(response.body, response.url)
-        final_url = response.permanent_url or url
-        if username and not http.auth_allowed(url, final_url):
+        # Where a permanent redirect leads is the server's word: taken without a login it may name.
+        final_url = sync_address(response.permanent_url) or url
+        if (username or password) and not http.auth_allowed(url, final_url):
             final_url = url  # the password belongs to the address it was entered for (see _move_feed)
         existing = self.db.get_feed_by_url(final_url)
         if existing is not None:
@@ -382,9 +392,12 @@ class Library:
         bus.emit("downloads-changed")
 
     def _move_feed(self, feed, new_url):
-        if self.db.get_feed_by_url(new_url) is not None:
+        # The feed or its server names the new address: only a plain web address, and never with a login in it
+        # (it would become this podcast's login).
+        new_url = sync_address(new_url)
+        if not new_url or new_url == feed.url or self.db.get_feed_by_url(new_url) is not None:
             return
-        if feed.username and not http.auth_allowed(feed.url, new_url):
+        if feed.login and not http.auth_allowed(feed.url, new_url):
             # Its password would go to the new host with every refresh. The old address still answers or
             # redirects (the new host never gets the password); moving to another host is up to the user, by
             # editing the address.
@@ -678,13 +691,20 @@ class Library:
         self._changed(feeds=True)
 
     def edit_feed_url(self, feed_id, new_url):
-        new_url, user, secret = http.split_userinfo(new_url or "")  # a login in the address: see preview
+        """The address the user typed for a podcast. False when another podcast has it; ValueError (with a text
+        for the user) when it is not a web address."""
+        new_url, user, secret = split_login((new_url or "").strip())  # a login in the address: see preview
         feed = self.db.get_feed(feed_id)
-        if feed is None or not new_url or self.db.get_feed_by_url(new_url):
+        if feed is None or feed.is_local:
             return False
-        login = {"username": user, "password": secret} if user else {}
+        if not sync_address(new_url):
+            raise ValueError(_("Enter a web address that starts with https:// or http://."))
+        other = self.db.get_feed_by_url(new_url)
+        if other is not None and other.id != feed_id:
+            return False
+        login = {"username": user, "password": secret} if user or secret else {}
         self.db.update_feed(feed_id, url=new_url, etag="", last_modified="", **login)
-        if feed.state == FEED_SUBSCRIBED:
+        if feed.state == FEED_SUBSCRIBED and new_url != plain_address(feed.url):
             self.sync_feed(feed.url, False)
             self.sync_feed(new_url, True)
         self._changed()

@@ -105,9 +105,10 @@ class Paths:
         return self.runtime / "state.json"
 
     def ensure(self):
+        # Owner only, from the moment they exist: listening history, passwords of protected podcasts, the proxy
+        # password. The chmod is for folders an earlier version made, and for a umask that takes more away.
         for path in (self.config, self.data, self.cache, self.images, self.runtime):
-            path.mkdir(parents=True, exist_ok=True)
-        # Owner only: listening history, passwords of protected podcasts, the proxy password.
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
         for path in (self.config, self.data, self.cache, self.runtime):
             try:
                 os.chmod(path, 0o700)
@@ -224,6 +225,11 @@ DEFAULTS = {
 
 
 _MISSING = object()
+
+# Forgets what the last sync of queue and favorites saw, so that the next one combines both sides again instead of
+# taking what differs here for changes made here.
+SHARED_SYNC_RESET = {"queue_sync_base": "", "queue_sync_local": "", "queue_sync_changed": 0,
+                     "favorites_sync_base": [], "favorites_sync_local": []}
 
 # Settings no page shows. Everything else counts as a change of what the pages show (see Settings.revision).
 _NOT_SHOWN = ("last_page", "window_width", "window_height", "window_maximized")
@@ -403,6 +409,14 @@ def move_secrets(store, secrets):
     for name in ("podcastindex_key", "podcastindex_secret"):
         if store.get(name) is not None:
             store.reset(name)
+    # Up to 0.1.4, what the last sync of the favorites saw was remembered with addresses as they were kept then,
+    # which could have a podcast's login in them (see "Logins in addresses" in util.py).
+    from .util import scrub_logins
+
+    for name in ("favorites_sync_base", "favorites_sync_local"):
+        remembered = store.get(name)
+        if scrub_logins(remembered) != remembered:
+            store.set(name, scrub_logins(remembered))
 
 
 _settings = None

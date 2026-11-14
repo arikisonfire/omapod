@@ -8,7 +8,7 @@ in the settings; AntennaPod ships its own, which we must not reuse.
 import hashlib
 import time
 from dataclasses import dataclass
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from .. import USER_AGENT
 from ..i18n import _
@@ -203,11 +203,17 @@ def top_podcasts(country, limit=25, subscribed_titles=()):
 def resolve_feed_url(result_or_url):
     """Turn an Apple lookup URL into the real feed URL."""
     url = result_or_url.feed_url if isinstance(result_or_url, SearchResult) else result_or_url
-    if "itunes.apple.com/lookup" in url or "podcasts.apple.com" in url:
-        if "podcasts.apple.com" in url:
+    try:
+        parts = urlsplit(url)
+        host, path = (parts.hostname or "").lower(), parts.path
+    except ValueError:
+        host, path = "", ""
+    # By the host, not by a look at the text: any address can have "podcasts.apple.com" somewhere in it.
+    if (host == "itunes.apple.com" and path.startswith("/lookup")) or host == "podcasts.apple.com":
+        if host == "podcasts.apple.com":
             import re
 
-            match = re.search(r"id(\d+)", url)
+            match = re.search(r"id(\d+)", path)
             if not match:
                 return url
             url = f"https://itunes.apple.com/lookup?id={match.group(1)}"

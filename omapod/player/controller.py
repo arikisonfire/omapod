@@ -21,7 +21,7 @@ from ..feeds import chapters as chapter_utils
 from ..i18n import _
 from ..models import PLAYED, VOLUME_ADAPTATIONS
 from ..net.http import auth_allowed
-from ..util import fmt_clock, fmt_speed
+from ..util import fmt_clock, fmt_speed, plain_address
 from .mpv import Mpv, MpvError
 
 SKIP_SILENCE_FILTER = ("@skipsilence:lavfi=[silenceremove=start_periods=0:stop_periods=-1:stop_duration=0.4:"
@@ -248,7 +248,7 @@ class PlayerController:
         self.temp_speed = None
         self.position = 0 if episode.is_played else episode.position
         self.duration = episode.duration
-        self.chapters = list(episode.psc_chapters or [])
+        self.chapters = list(episode.psc_chapters or [])[:chapter_utils.MAX_CHAPTERS]
         self.chapter_index = chapter_utils.index_at(self.chapters, self.position)
         self.start_position = self.position
         self.loaded = False
@@ -289,16 +289,19 @@ class PlayerController:
             self.library.db.update_episode(episode.id, file_path="", downloaded_at=0)
             episode.file_path, episode.downloaded_at = "", 0
             bus.emit("episodes-changed", {episode.id})
-        url = episode.media_url
-        parts = urlsplit(url)
-        if parts.scheme.lower() not in ("http", "https"):
+        url = plain_address(episode.media_url)  # the only login mpv gets is the podcast's own, added below
+        try:
+            parts = urlsplit(url)
+        except ValueError:
             return None
-        if (self.feed is not None and self.feed.username and not parts.username
-                and auth_allowed(self.feed.url, url)):
+        if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+            return None
+        login = self.feed.login if self.feed is not None else None
+        if login and auth_allowed(self.feed.url, url):
             # Only for the podcast's own server, and as user:password in the address, not as a header: ffmpeg
             # sends a header to every host a redirect points to, but address credentials only to that host and
             # only once it asks for them (401). Media hosts elsewhere never get them, not even when they ask.
-            userinfo = f"{quote(self.feed.username, safe='')}:{quote(self.feed.password or '', safe='')}@"
+            userinfo = f"{quote(login[0], safe='')}:{quote(login[1] or '', safe='')}@"
             url = urlunsplit(parts._replace(netloc=userinfo + parts.netloc))
         return url
 

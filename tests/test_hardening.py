@@ -303,7 +303,11 @@ class CredentialsStayWithTheirHost(Servers):
                 ("https://cdn.example/ep.mp3", "https://cdn.example/ep.mp3"),  # marketplace review of 0.1.0
                 ("http://cdn.example/ep.mp3", "http://cdn.example/ep.mp3"),
                 ("https://podcast.example:8443/ep.mp3", "https://podcast.example:8443/ep.mp3"),
-                ("https://own:login@cdn.example/ep.mp3", "https://own:login@cdn.example/ep.mp3")):
+                # A login written into an address is never used: the only one is the podcast's own (test_logins).
+                ("https://own:login@cdn.example/ep.mp3", "https://cdn.example/ep.mp3"),
+                ("https://own:login@podcast.example/ep.mp3", "https://us%20er:p%40ss%3Aword@podcast.example/ep.mp3"),
+                # No login for it: Python reads no port here, but ffmpeg would read 8443 (see test_exposure).
+                ("https://podcast.example:8443x/ep.mp3", "https://podcast.example:8443x/ep.mp3")):
             player.episode = Episode(media_url=media)
             self.assertEqual(player._source(), expected)
         player.feed = Feed(url="http://podcast.example/feed.xml", username="user", password="pass")

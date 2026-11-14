@@ -49,6 +49,11 @@ def _apply_pending_import():
         except FileNotFoundError:
             pass
     os.replace(pending, paths.db)
+    # Queue and favorites of the new library are not changes made here: the next sync with other omaPOD computers
+    # combines both sides, as on the first time, instead of replacing their queue and taking back their favorites.
+    from .config import SHARED_SYNC_RESET, settings
+
+    settings().update(SHARED_SYNC_RESET)
 
 
 def _ctl_payload(command, value):

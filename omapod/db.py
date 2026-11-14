@@ -13,9 +13,11 @@ import shutil
 import sqlite3
 import tempfile
 import threading
-from contextlib import contextmanager, suppress
+from contextlib import closing, contextmanager, suppress
+from pathlib import Path
 
-from .models import FEED_PREVIEW, FEED_SUBSCRIBED, NEW, PLAYED, UNPLAYED, Episode, Feed
+from .models import FEED_PREVIEW, FEED_SUBSCRIBED, LOCAL_PREFIX, NEW, PLAYED, UNPLAYED, Episode, Feed
+from .util import plain_address, scrub_logins, split_login
 
 SCHEMA_VERSION = 1
 
@@ -250,12 +252,43 @@ EPISODE_COLUMNS = [
 ]
 
 
+# Columns that hold an address. None of them is ever stored with a login in it (util.split_login): addresses go
+# to the sync server, into exports, the download log and to the bar widget, and a login must not go along.
+FEED_ADDRESSES = ("link", "image_url", "next_page_url")
+EPISODE_ADDRESSES = ("link", "image_url", "media_url", "chapters_url", "transcript_url", "social_url")
+
+
 def _encode(value):
     if isinstance(value, (list, dict)):
         return json.dumps(value, ensure_ascii=False)
     if isinstance(value, bool):
         return int(value)
     return value
+
+
+def _feed_values(values):
+    """A podcast's values as they are stored. A login in its address (https://user:password@host/feed) becomes
+    the podcast's login, unless one is given along, and the address is stored without it; its other addresses
+    lose theirs. Every way a podcast gets into the library ends here: typed, from an OPML file, a link, a feed
+    that moved, a sync server."""
+    values = dict(values)
+    url = values.get("url")
+    if isinstance(url, str) and not url.startswith(LOCAL_PREFIX):
+        values["url"], user, password = split_login(url)
+        if (user or password) and not values.get("username") and not values.get("password"):
+            values["username"], values["password"] = user, password
+    for name in FEED_ADDRESSES:
+        if isinstance(values.get(name), str):
+            values[name] = plain_address(values[name])
+    return values
+
+
+def _episode_values(values):
+    """An episode's values as they are stored: its addresses without a login (see _feed_values)."""
+    if not any(isinstance(values.get(name), str) and "@" in values[name] for name in EPISODE_ADDRESSES):
+        return values
+    return {name: plain_address(value) if name in EPISODE_ADDRESSES and isinstance(value, str) else value
+            for name, value in values.items()}
 
 
 def smart_shuffle(episodes, newest_first=False):
@@ -328,6 +361,66 @@ def write_snapshot(conn, handle, folder):
                 os.unlink(leftover)
 
 
+# What a library brought from elsewhere may hold: its rows of these tables. What it kept for its sync server
+# (sync_queue, sync_seen, remote_downloads) stays behind (see ui.preferences.prepare_import).
+IMPORTED_TABLES = ("feeds", "episodes", "queue", "chapters", "download_log", "listen_log", "meta")
+_LARGEST = 2 ** 53  # numbers beyond this are no time, size or count; they are kept to it
+
+
+def _text(value):
+    """Text as it can be read back: a value that is no valid UTF-8 would stop every query that meets it."""
+    return None if value is None else bytes(value).decode("utf-8", "replace")
+
+
+def rebuild(source, target):
+    """Copies the rows of the library `source` (a file from anywhere, checked by ui.preferences.check_import)
+    into a new library at `target`, an empty file, made from omaPOD's own schema. Nothing of the other file's
+    structure comes along: not its column types, constraints, defaults, indexes, collations or extra columns,
+    which would decide what omaPOD can write later. Each value becomes one of the column's type (text that is
+    valid UTF-8, numbers within reach); one that is missing, the column's default; a row that still does not
+    fit (no address, an address twice, an episode of no podcast) is left out."""
+    with closing(sqlite3.connect(target, uri=True, isolation_level=None)) as conn:
+        conn.create_function("omapod_text", 1, _text, deterministic=True)
+        conn.execute("PRAGMA trusted_schema = OFF")
+        conn.executescript(SCHEMA)
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        conn.execute("ATTACH DATABASE ? AS old", (Path(source).absolute().as_uri() + "?mode=ro",))
+        try:
+            conn.execute("BEGIN")
+            for table in IMPORTED_TABLES:
+                theirs = {row[1] for row in conn.execute(f'PRAGMA old.table_info("{table}")')}
+                names, values = [], []
+                for _cid, name, kind, _notnull, default, _pk in conn.execute(f'PRAGMA main.table_info("{table}")'):
+                    if name not in theirs:
+                        continue  # the column's default
+                    value = f'old."{table}"."{name}"'
+                    if kind == "TEXT":
+                        value = f"omapod_text(CAST({value} AS BLOB))"
+                    elif kind == "INTEGER":
+                        value = f"MIN(MAX(CAST({value} AS INTEGER), -{_LARGEST}), {_LARGEST})"
+                    elif kind == "REAL":
+                        value = f"MIN(MAX(CAST({value} AS REAL), -{_LARGEST}.0), {_LARGEST}.0)"
+                    if default is not None:
+                        value = f"COALESCE({value}, {default})"
+                    names.append(f'"{name}"')
+                    values.append(value)
+                if names:
+                    conn.execute(f'INSERT OR IGNORE INTO main."{table}" ({", ".join(names)}) '
+                                 f'SELECT {", ".join(values)} FROM old."{table}"')
+            conn.execute("DELETE FROM episodes WHERE feed_id NOT IN (SELECT id FROM feeds)")
+            for table in ("queue", "chapters"):
+                conn.execute(f"DELETE FROM {table} WHERE episode_id NOT IN (SELECT id FROM episodes)")
+            # The statistics read the day as a date.
+            conn.execute("DELETE FROM listen_log WHERE day NOT GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]'")
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.execute("DETACH DATABASE old")
+
+
 class Database:
     def __init__(self, path):
         self.path = str(path)
@@ -337,6 +430,7 @@ class Database:
             os.close(os.open(self.path, os.O_WRONLY | os.O_CREAT, 0o600))  # an empty file is a new database
         make_private(self.path)
         self.migrate()
+        self.cleaned = self.take_logins_out_of_addresses()
 
     # -- connections ---------------------------------------------------
 
@@ -409,6 +503,78 @@ class Database:
             conn.executescript(SCHEMA)
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
+    def take_logins_out_of_addresses(self):
+        """Applies the rule that no stored address carries a login (see _feed_values) to what is already there,
+        every time the database opens: a library from omaPOD up to 0.1.4, which kept an address as it was typed
+        or as a sync server named it, and one that was imported or put in place by hand. It is not done once and
+        marked as done, because the mark would come along with such a library. Returns how much it changed.
+
+        - A podcast's address: the login becomes the podcast's login if it has none.
+        - Addresses of episodes, what waits to go to the sync server, the download log and what sync remembers
+          about other devices: the login is dropped.
+        A clean library costs a few index scans."""
+        changed = 0
+        with self.tx() as conn:
+            names = ", ".join(("url",) + FEED_ADDRESSES)
+            where = " OR ".join(f"{name} LIKE '%@%'" for name in ("url",) + FEED_ADDRESSES)
+            for row in conn.execute(f"SELECT id, username, password, {names} FROM feeds WHERE {where}").fetchall():
+                if row["url"].startswith(LOCAL_PREFIX):
+                    continue
+                values = {name: plain_address(row[name]) for name in FEED_ADDRESSES
+                          if plain_address(row[name]) != row[name]}
+                url, user, password = split_login(row["url"])
+                if url != row["url"]:
+                    values["url"] = self._free_address(conn, url, row["id"])
+                    if (user or password) and not row["username"] and not row["password"]:
+                        values.update(username=user, password=password)
+                if values:
+                    conn.execute(f"UPDATE feeds SET {', '.join(name + ' = ?' for name in values)} WHERE id = ?",
+                                 list(values.values()) + [row["id"]])
+                    changed += 1
+            # media_url is in an index, so this reads no episode rows; an episode's other addresses lose a login
+            # when its feed is read again (_episode_values), and they go nowhere but to the server they name.
+            for row in conn.execute("SELECT id, media_url FROM episodes WHERE media_url LIKE '%@%'").fetchall():
+                media_url = plain_address(row["media_url"])
+                if media_url != row["media_url"]:
+                    conn.execute("UPDATE episodes SET media_url = ? WHERE id = ?", (media_url, row["id"]))
+                    changed += 1
+            for row in conn.execute("SELECT id, payload FROM sync_queue WHERE payload LIKE '%@%'").fetchall():
+                try:
+                    payload = json.dumps(scrub_logins(json.loads(row["payload"])), ensure_ascii=False)
+                except ValueError:
+                    conn.execute("DELETE FROM sync_queue WHERE id = ?", (row["id"],))
+                    continue
+                if payload != row["payload"]:
+                    conn.execute("UPDATE sync_queue SET payload = ? WHERE id = ?", (payload, row["id"]))
+                    changed += 1
+            for row in conn.execute("SELECT id, url FROM download_log WHERE url LIKE '%@%'").fetchall():
+                if plain_address(row["url"]) != row["url"]:
+                    conn.execute("UPDATE download_log SET url = ? WHERE id = ?", (plain_address(row["url"]), row["id"]))
+                    changed += 1
+            for row in conn.execute("SELECT episode FROM remote_downloads WHERE episode LIKE '%@%'").fetchall():
+                if plain_address(row["episode"]) != row["episode"]:
+                    conn.execute("UPDATE OR REPLACE remote_downloads SET episode = ? WHERE episode = ?",
+                                 (plain_address(row["episode"]), row["episode"]))
+                    changed += 1
+            for row in conn.execute("SELECT key FROM sync_seen WHERE key LIKE '%@%'").fetchall():
+                kind, colon, address = row["key"].partition(":")
+                if colon and plain_address(address) != address:
+                    conn.execute("UPDATE OR REPLACE sync_seen SET key = ? WHERE key = ?",
+                                 (f"{kind}:{plain_address(address)}", row["key"]))
+                    changed += 1
+        return changed
+
+    @staticmethod
+    def _free_address(conn, url, feed_id):
+        """url, or url with a mark behind "#" when another podcast has that address already: the same podcast was
+        added twice, once with the login in its address. Both stay, each with its episodes. What follows "#" goes
+        neither to the feed's server nor to the sync server (util.sync_feed_address)."""
+        candidate, number = url, 1
+        while conn.execute("SELECT 1 FROM feeds WHERE url = ? AND id != ?", (candidate, feed_id)).fetchone():
+            number += 1
+            candidate = f"{url}{'-' if '#' in url else '#'}{number}"
+        return candidate
+
     # -- meta ------------------------------------------------------------
 
     def get_meta(self, key, default=None):
@@ -451,11 +617,13 @@ class Database:
         return Feed.from_row(row) if row else None
 
     def insert_feed(self, conn, values):
+        values = _feed_values(values)
         cols = [c for c in FEED_COLUMNS if c in values]
         sql = f"INSERT INTO feeds ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})"
         return conn.execute(sql, [_encode(values[c]) for c in cols]).lastrowid
 
     def update_feed(self, feed_id, conn=None, **values):
+        values = _feed_values(values)
         cols = [c for c in FEED_COLUMNS if c in values]
         if not cols:
             return
@@ -541,11 +709,13 @@ class Database:
         ).fetchall()
 
     def insert_episode(self, conn, values):
+        values = _episode_values(values)
         cols = [c for c in EPISODE_COLUMNS if c in values]
         sql = f"INSERT INTO episodes ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})"
         return conn.execute(sql, [_encode(values[c]) for c in cols]).lastrowid
 
     def update_episode(self, episode_id, conn=None, **values):
+        values = _episode_values(values)
         cols = [c for c in EPISODE_COLUMNS if c in values]
         if not cols:
             return
@@ -558,6 +728,7 @@ class Database:
 
     def update_episodes(self, ids, conn=None, **values):
         ids = [int(i) for i in ids]
+        values = _episode_values(values)
         cols = [c for c in EPISODE_COLUMNS if c in values]
         if not ids or not cols:
             return
@@ -626,8 +797,8 @@ class Database:
             conn.execute("DELETE FROM chapters WHERE episode_id = ?", (episode_id,))
             conn.executemany(
                 "INSERT INTO chapters(episode_id, start_ms, title, url, image_url, source) VALUES(?, ?, ?, ?, ?, ?)",
-                [(episode_id, int(c["start"]), c.get("title") or "", c.get("url") or "",
-                  c.get("image") or "", source) for c in chapters],
+                [(episode_id, int(c["start"]), c.get("title") or "", plain_address(c.get("url") or ""),
+                  plain_address(c.get("image") or ""), source) for c in chapters],
             )
             conn.execute("UPDATE episodes SET has_chapters = ? WHERE id = ?", (1 if chapters else 0, episode_id))
 
@@ -639,7 +810,8 @@ class Database:
         with self.tx() as conn:
             conn.execute("INSERT INTO download_log(ts, kind, ref_id, title, url, success, reason, detail) "
                          "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-                         (now_s(), kind, ref_id or 0, title or "", url or "", 1 if success else 0, reason, detail))
+                         (now_s(), kind, ref_id or 0, title or "", plain_address(url or ""), 1 if success else 0,
+                          reason, detail))
             conn.execute("DELETE FROM download_log WHERE id NOT IN (SELECT id FROM download_log ORDER BY ts DESC LIMIT 500)")
 
     def get_log(self, limit=200):
@@ -663,16 +835,18 @@ class Database:
         from .util import now_s
 
         self.execute("INSERT INTO sync_queue(kind, payload, created) VALUES(?, ?, ?)",
-                     (kind, json.dumps(payload, ensure_ascii=False), now_s()))
+                     (kind, json.dumps(scrub_logins(payload), ensure_ascii=False), now_s()))
 
     def sync_pending(self, kind):
         rows = self.query("SELECT id, payload FROM sync_queue WHERE kind = ? ORDER BY id", (kind,))
         result = []
         for row in rows:
             try:
-                result.append((row["id"], json.loads(row["payload"])))
+                payload = scrub_logins(json.loads(row["payload"]))
             except ValueError:
-                pass
+                continue
+            if isinstance(payload, dict):
+                result.append((row["id"], payload))
         return result
 
     def sync_remove(self, ids):
@@ -706,7 +880,8 @@ class Database:
                 "INSERT INTO remote_downloads(episode, guid, downloaded, ts) VALUES(?, ?, ?, ?) "
                 "ON CONFLICT(episode) DO UPDATE SET guid = excluded.guid, downloaded = excluded.downloaded, "
                 "ts = excluded.ts WHERE excluded.ts >= remote_downloads.ts",
-                [(episode, guid or "", 1 if downloaded else 0, int(ts)) for episode, guid, downloaded, ts in rows])
+                [(plain_address(episode), guid or "", 1 if downloaded else 0, int(ts))
+                 for episode, guid, downloaded, ts in rows])
 
     def remote_downloads(self):
         """(media address, guid) of what other devices have downloaded, most recent first."""

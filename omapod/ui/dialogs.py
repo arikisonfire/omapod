@@ -273,8 +273,41 @@ def ask_credentials(parent, what, callback, username="", plain=False):
     dialog.set_default_response("ok")
 
     def on_response(_dialog, response):
-        if response == "ok" and user.get_text():
+        if response == "ok" and (user.get_text() or password.get_text()):  # a token can be a password without a name
             callback(user.get_text(), password.get_text())
+
+    dialog.connect("response", on_response)
+    dialog.present(parent)
+    return dialog
+
+
+def ask_sync_account(parent, user, host, on_yes, on_no=None):
+    """Names the account a Nextcloud login in the browser ended in, before anything is sent to it.
+
+    The address of the login page goes to the browser as a program argument, which other accounts on this
+    computer can read while the browser starts. Whoever opens that address and logs in first decides which
+    account omaPOD is given, and the first synchronization uploads the subscriptions and what was listened to.
+    So the account is shown, and nothing is stored or sent until the user says it is theirs."""
+    dialog = Adw.AlertDialog(heading=_("Synchronize with this account?"),
+                             body=_("omaPOD was given access to the account “{user}” on {host}. Your subscriptions "
+                                    "and what you listen to are sent there. Cancel if this is not your "
+                                    "account.").format(user=user, host=host))
+    dialog.add_response("cancel", _("Cancel"))
+    dialog.add_response("ok", _("Synchronize"))
+    dialog.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+    dialog.set_default_response("ok")
+    dialog.set_close_response("cancel")
+
+    answered = []
+
+    def on_response(_dialog, response):
+        if answered:  # one answer only: closing the dialog after it must not count as Cancel as well
+            return
+        answered.append(response)
+        if response == "ok":
+            on_yes()
+        elif on_no is not None:
+            on_no()
 
     dialog.connect("response", on_response)
     dialog.present(parent)

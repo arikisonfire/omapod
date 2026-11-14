@@ -41,6 +41,7 @@ class SyncState:
         # server in the poll answer); None: its own.
         self.login_base = None
         self.login_server = None
+        self.revoked = False
 
     def tick(self):
         # Real servers use epoch seconds; run one second ahead so changes made in the same
@@ -301,6 +302,14 @@ class Handler(BaseHTTPRequestHandler):
         etag = f'"{self.server.dav_version}"'
         self.server.dav[path] = (body, etag)
         return self._send(201 if stored is None else 204, b"", "text/plain", {"ETag": etag})
+
+    def do_DELETE(self):
+        self.server.requests.append(("DELETE", self.path))
+        # Nextcloud forgets the app password a request is made with.
+        if urlsplit(self.path).path == "/ocs/v2.php/core/apppassword" and self._auth_ok():
+            self.server.sync.revoked = True
+            return self._json({"ocs": {"meta": {"status": "ok", "statuscode": 200}, "data": []}})
+        return self._send(401 if not self._auth_ok() else 404, b"", "text/plain")
 
     def do_MKCOL(self):
         path = urlsplit(self.path).path.rstrip("/") + "/"

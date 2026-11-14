@@ -1,6 +1,7 @@
 """Plain data objects for podcasts (feeds) and episodes."""
 
 import json
+import math
 from dataclasses import dataclass, field, fields
 
 # Feed.state
@@ -40,16 +41,35 @@ def _known_values(row, names):
     return {key: value for key, value in zip(row.keys(), row) if value is not None and key in names}
 
 
-def _json_list(value):
+def _json_list(value, keep=None):
+    """A list stored as JSON, with only the entries `keep` accepts: the library may come from anywhere (an
+    import), and the pages read each entry the way omaPOD writes them."""
     if isinstance(value, list):
-        return value
-    if not value:
+        data = value
+    elif not value:
         return []
-    try:
-        data = json.loads(value)
-        return data if isinstance(data, list) else []
-    except ValueError:
-        return []
+    else:
+        try:
+            data = json.loads(value)
+        except (ValueError, RecursionError):
+            return []
+        if not isinstance(data, list):
+            return []
+    return [entry for entry in data if keep is None or keep(entry)]
+
+
+def _is_text(entry):
+    return isinstance(entry, str)
+
+
+def _is_link(entry):
+    return isinstance(entry, dict) and isinstance(entry.get("url"), str) and isinstance(entry.get("title", ""), str)
+
+
+def _is_chapter(entry):
+    return (isinstance(entry, dict) and isinstance(entry.get("start"), (int, float))
+            and not isinstance(entry.get("start"), bool) and math.isfinite(entry["start"])
+            and all(isinstance(entry.get(name, ""), str) for name in ("title", "url", "image")))
 
 
 @dataclass
@@ -104,8 +124,9 @@ class Feed:
     @classmethod
     def from_row(cls, row):
         values = _known_values(row, FEED_FIELDS)
-        for name in ("funding", "episode_filter", "tags"):
-            values[name] = _json_list(values.get(name))
+        values["funding"] = _json_list(values.get("funding"), _is_link)
+        for name in ("episode_filter", "tags"):
+            values[name] = _json_list(values.get(name), _is_text)
         return cls(**values)
 
     @property
@@ -115,6 +136,12 @@ class Feed:
     @property
     def is_local(self):
         return self.url.startswith(LOCAL_PREFIX)
+
+    @property
+    def login(self):
+        """(username, password) of a protected podcast, None without a login. A password without a name counts:
+        some hosts hand out an access token to be used that way."""
+        return (self.username, self.password) if self.username or self.password else None
 
     @property
     def local_path(self):
@@ -178,7 +205,7 @@ class Episode:
     @classmethod
     def from_row(cls, row):
         values = _known_values(row, EPISODE_FIELDS)
-        values["psc_chapters"] = _json_list(values.get("psc_chapters"))
+        values["psc_chapters"] = _json_list(values.get("psc_chapters"), _is_chapter)
         return cls(**values)
 
     @property

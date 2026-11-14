@@ -27,7 +27,7 @@ from ..net.downloads import DownloadManager
 from ..player.controller import PlayerController
 from ..player.ipc import ControlServer
 from ..sync.service import SyncService
-from ..util import now_s
+from ..util import mail_link, now_s
 
 ROOT_PAGES = ("home", "queue", "inbox", "episodes", "favorites", "subscriptions", "downloads", "history",
               "statistics", "add", "search")
@@ -624,11 +624,16 @@ class OmaPodApp(Adw.Application):
         like), so those are only copied."""
         if not uri:
             return False
-        if urlsplit(uri.strip()).scheme.lower() not in ("http", "https", "mailto"):
+        try:
+            scheme = urlsplit(uri.strip()).scheme.lower()
+        except ValueError:
+            scheme = ""
+        if scheme not in ("http", "https", "mailto"):
             if self.window is not None:
                 self.window.get_clipboard().set(uri)
                 self.toast(_("omaPOD opens only web links. This one was copied to the clipboard."))
             return False
+        uri = mail_link(uri) if scheme == "mailto" else uri.strip()
         # Not Gtk.UriLauncher: on the host it goes through the desktop portal, which reports success
         # even when the browser it starts never shows up, so the fallback below never ran. GIO starts
         # the browser from our own session and falls back to the portal only in a Flatpak or Snap.

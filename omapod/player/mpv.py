@@ -17,6 +17,11 @@ import time
 from .. import USER_AGENT
 
 
+# Far longer than anything mpv sends omaPOD. Its messages carry what a media file says about itself (tags,
+# chapters), and a line without an end would otherwise grow until memory runs out.
+MAX_MESSAGE = 64 * 1024 * 1024
+
+
 class MpvError(Exception):
     pass
 
@@ -51,9 +56,12 @@ class Mpv:
         # its password, which ffmpeg hands to whoever answers 401. With it, ffmpeg checks the certificate and the
         # host name against the system's certificate authorities before anything is sent, on redirects, retries
         # and HLS segments too, like the rest of omaPOD.
+        # --demuxer=lavf: what a media host sends is read as a media file by ffmpeg, never by mpv's own readers
+        # for playlists, archives, cue sheets or edit lists. Left to itself, mpv takes an answer that is a
+        # playlist for one, of any length, and goes on to play the addresses in it.
         args = [
             "mpv", "--idle=yes", "--no-config", "--no-terminal", f"--input-ipc-server={self.socket_path}",
-            "--tls-verify=yes",
+            "--tls-verify=yes", "--demuxer=lavf",
             "--audio-display=no", "--vid=no", "--force-window=no", "--keep-open=no", "--ytdl=no",
             "--cache=yes", "--demuxer-max-bytes=64MiB", "--demuxer-readahead-secs=60",
             "--audio-client-name=omaPOD", f"--user-agent={USER_AGENT}", f"--volume={int(volume)}",
@@ -64,7 +72,9 @@ class Mpv:
         if ao:
             args.append(f"--ao={ao}")
         args += self.extra_args
-        log = open(self.log_path, "ab") if self.log_path else subprocess.DEVNULL
+        log = subprocess.DEVNULL
+        if self.log_path:  # owner only, like everything omaPOD keeps
+            log = os.fdopen(os.open(self.log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC, 0o600), "ab")
         self.process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                         start_new_session=True)
         if log is not subprocess.DEVNULL:
@@ -118,6 +128,8 @@ class Mpv:
                     import traceback
 
                     traceback.print_exc()
+            if len(buffer) > MAX_MESSAGE:
+                buffer = b""  # dropped; the rest of that line does not parse when its end comes, and is skipped
         self.alive = False
         for slot in list(self._pending.values()):
             slot["event"].set()

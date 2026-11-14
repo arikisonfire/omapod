@@ -17,7 +17,7 @@ from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
 
-from ..util import MAX_SECONDS, clip, parse_time_string
+from ..util import MAX_SECONDS, clip, parse_time_string, plain_address
 
 
 class FeedParseError(Exception):
@@ -340,14 +340,25 @@ def parse_feed(data, url=""):
     return _short_names(_web_only(_parse_feed(data, url), url))
 
 
+# Episodes read from one page of a feed. The largest archives have a few ten thousand; a feed can name millions in
+# the 64 MB it may have, each one a row in the library.
+MAX_ITEMS = 50_000
+
+
 def _web(url, base=""):
-    url = urljoin(base, (url or "").strip()) if url and url.strip() else ""
-    return url if urlsplit(url).scheme.lower() in ("http", "https") else ""
+    try:
+        url = urljoin(base, (url or "").strip()) if url and url.strip() else ""
+        web = urlsplit(url).scheme.lower() in ("http", "https")
+    except ValueError:  # an address Python cannot take apart (brackets that are no IPv6 address)
+        return ""
+    return plain_address(url) if web else ""
 
 
 def _web_only(feed, base):
     """Addresses in a feed come from strangers and go to mpv, the image loader and the desktop's URL handlers:
-    only web addresses are kept (no file:, smb:, av:lavfi: or the like), relative ones made absolute."""
+    only web addresses are kept (no file:, smb:, av:lavfi: or the like), relative ones made absolute. And none
+    keeps a login (https://user:password@host/…): addresses also go to the sync server, and the one login a
+    podcast has is the one the user entered for it."""
     names = ("link", "image_url", "next_page_url", "new_feed_url", "media_url", "chapters_url", "transcript_url",
              "social_url")
     for entry in [feed] + feed.items:
@@ -457,7 +468,8 @@ def _parse_rss_channel(channel, items, base_url):
         feed.image_url = rss_image.strip()
     if feed.image_url and base_url:
         feed.image_url = urljoin(base_url, feed.image_url)
-    feed.items = [item for item in (_parse_rss_item(element, base_url) for element in items) if item is not None]
+    feed.items = [item for item in (_parse_rss_item(element, base_url) for element in items[:MAX_ITEMS])
+                  if item is not None]
     return feed
 
 
@@ -583,8 +595,12 @@ def _media_content(item, child, had_default, base_url):
 
 
 def _parse_psc(element):
+    from .chapters import MAX_CHAPTERS
+
     chapters = []
     for chapter in element:
+        if len(chapters) >= MAX_CHAPTERS:
+            break
         if _tag(chapter) != "psc:chapter" or not chapter.get("start"):
             continue
         try:
@@ -633,7 +649,7 @@ def _parse_atom(root, base_url):
             feed.funding.append({"url": child.get("url"), "title": _text(child)})
         elif tag == "entry":
             entries.append(child)
-    for entry in entries:
+    for entry in entries[:MAX_ITEMS]:
         item = ParsedItem()
         descriptions = []
         transcripts = []

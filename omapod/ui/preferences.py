@@ -13,15 +13,16 @@ from pathlib import Path
 from gi.repository import Adw, Gio, GLib, Gtk
 
 from .. import APP_NAME
-from ..config import DEFAULTS, copy_regular_file, own_downloads_dir, owns_file, paths, private_file
-from ..db import SCHEMA_VERSION, discard_stale
+from ..config import (DEFAULTS, SHARED_SYNC_RESET, copy_regular_file, own_downloads_dir, owns_file, paths,
+                      private_file)
+from ..db import SCHEMA_VERSION, discard_stale, rebuild
 from ..i18n import _, ngettext
 from ..models import LOCAL_PREFIX
-from ..sync.providers import (GpodderNet, NextcloudLoginFlow, PlainHttpOnly, SyncError, UntrustedCertificate, host_of,
-                              normalize_host)
+from ..sync.providers import (GpodderNet, Nextcloud, NextcloudLoginFlow, PlainHttpOnly, SyncError,
+                              UntrustedCertificate, host_of, normalize_host)
 from ..sync.service import default_device_id
 from ..util import fmt_datetime, fmt_speed, web_url
-from .dialogs import _combo_row, password_hash
+from .dialogs import _combo_row, ask_sync_account, password_hash
 from .widgets.common import label, text_row
 
 REFRESH = [(0, _("Never")), (60, _("Every hour")), (120, _("Every 2 hours")), (240, _("Every 4 hours")),
@@ -36,15 +37,14 @@ BUTTONS = [("fast_forward", _("Fast-forward")), ("rewind", _("Rewind")), ("skip"
            ("restart", _("Restart episode"))]
 ENQUEUE = [("back", _("Back")), ("front", _("Front")), ("after_current", _("After current episode")),
            ("random", _("Random"))]
-# Forget what the last sync of queue and favorites saw, so the next one combines both sides again.
-SHARED_SYNC_RESET = {"queue_sync_base": "", "queue_sync_local": "", "queue_sync_changed": 0,
-                     "favorites_sync_base": [], "favorites_sync_local": []}
 PAGES = [("home", _("Home")), ("queue", _("Queue")), ("inbox", _("Inbox")), ("episodes", _("Episodes")),
          ("subscriptions", _("Subscriptions")), ("downloads", _("Downloads")), ("remember", _("Remember last page"))]
 
 
 # Far beyond any library; a file like this is not one, and copying it would only fill the disk.
 MAX_IMPORT_BYTES = 4 * 1024 ** 3
+# What a library keeps for its sync server: uploads that wait, and what it saw of other devices. Not imported.
+SYNC_TABLES = {"sync_queue", "sync_seen", "remote_downloads"}
 
 
 def export_database(app, target):
@@ -97,14 +97,29 @@ def check_chosen(source):
 
 
 def stage_import(source, known=()):
-    """Readies the file the user chose for import: a private copy of it is checked and cleaned (prepare_import)
-    and then waits to replace the library at the next start. Returns a problem text, or None."""
+    """Readies the file the user chose for import: a private copy of it is checked, its rows go into a new
+    library of omaPOD's own making (db.rebuild), which is cleaned (prepare_import) and then waits to replace the
+    library at the next start. Returns a problem text, or None."""
+    folder = os.path.dirname(pending_import_path())
     try:
         with private_copy(source) as copy:
-            problem = prepare_import(copy, known)
-            if problem is None:
-                os.replace(copy, pending_import_path())
-            return problem
+            problem = check_import(copy)
+            if problem:
+                return problem
+            fd, staged = tempfile.mkstemp(dir=folder, prefix=".import-", suffix=".db")
+            os.close(fd)
+            try:
+                rebuild(copy, staged)
+                problem = prepare_import(staged, known)
+                if problem is None:
+                    os.replace(staged, pending_import_path())
+                return problem
+            finally:
+                for leftover in (staged, staged + "-journal", staged + "-wal", staged + "-shm"):
+                    with contextlib.suppress(OSError):
+                        os.unlink(leftover)
+    except sqlite3.Error as error:
+        return _("This file is not an omaPOD database ({error}).").format(error=error)
     except (OSError, ValueError) as error:
         return str(error)
 
@@ -145,6 +160,8 @@ def prepare_import(path, known=()):
     the download folder, or, for a podcast of a folder, a file outside a folder the user chose on this computer.
     omaPOD's own download folder holds nothing but its downloads; one the user chose may hold other files as well,
     so there the import keeps only `known`, the files of the downloads the current library has.
+    What the other library had waiting for its sync server, and what it remembered of it, stays behind too: sent
+    from here, it would unsubscribe podcasts and move positions on this account's other devices.
     Returns a problem text, or None."""
     problem = check_import(path)
     if problem:
@@ -165,6 +182,9 @@ def prepare_import(path, known=()):
                                 "WHERE e.file_path IS NOT NULL AND e.file_path != ''").fetchall()
             foreign = [(episode_id,) for episode_id, file_path, url in rows if not kept(file_path, url)]
             conn.executemany("UPDATE episodes SET file_path = '', downloaded_at = 0 WHERE id = ?", foreign)
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            for table in SYNC_TABLES & tables:
+                conn.execute(f"DELETE FROM {table}")
             conn.commit()
         finally:
             conn.close()
@@ -683,8 +703,18 @@ class Preferences(Adw.PreferencesDialog):
             if state["cancelled"]:
                 return False
             waiting.close()
-            server, login, app_password = result
-            self._finish_login("nextcloud", server, login, app_password, cert_sha256=flow.cert_sha256)
+            server, login, app_password = (str(part) for part in result)
+
+            def forget():
+                # Not the user's account, or not wanted after all: the app password just made is given back.
+                from .app import run_in_thread
+
+                run_in_thread(Nextcloud(server, login, app_password, flow.cert_sha256).revoke)
+
+            # Nothing is stored or sent before the user has seen whose account this is (ask_sync_account).
+            ask_sync_account(self, login, host_of(server),
+                             lambda: self._finish_login("nextcloud", server, login, app_password,
+                                                        cert_sha256=flow.cert_sha256), forget)
             return False
 
         def untrusted(error):
@@ -876,8 +906,12 @@ class Preferences(Adw.PreferencesDialog):
             except GLib.Error:
                 return
             if file is not None:
+                path = file.get_path()
+                if not path:  # a place the file dialog offers that is no folder of this computer
+                    self.toast(_("Export error: {error}").format(error=_("Choose a folder on this computer.")), 6)
+                    return
                 try:
-                    callback(file.get_path())
+                    callback(path)
                     self.toast(_("Export successful"))
                 except OSError as error:
                     self.toast(_("Export error: {error}").format(error=error), 6)

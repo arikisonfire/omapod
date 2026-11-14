@@ -3,7 +3,11 @@ files and from the media file itself, merged the way AntennaPod does it."""
 
 import json
 
-from ..util import MAX_SECONDS, clip
+from ..util import MAX_SECONDS, clip, plain_address
+
+# Far more than any episode has. Chapters come from feeds, chapter files and media files, and each one becomes a
+# row on Now Playing and a segment of the progress bar: a list of millions would stall the window.
+MAX_CHAPTERS = 1000
 
 
 def parse_json_chapters(data):
@@ -16,7 +20,7 @@ def parse_json_chapters(data):
     if not isinstance(items, list):
         return None
     chapters = []
-    for entry in items:
+    for entry in items[:MAX_CHAPTERS]:
         if not isinstance(entry, dict):
             continue
         try:
@@ -28,8 +32,8 @@ def parse_json_chapters(data):
         chapters.append({
             "start": int(round(start * 1000)),
             "title": clip(str(entry.get("title") or "")),
-            "url": str(entry.get("url") or ""),
-            "image": str(entry.get("img") or ""),
+            "url": plain_address(str(entry.get("url") or "")),
+            "image": plain_address(str(entry.get("img") or "")),
         })
     chapters.sort(key=lambda c: c["start"])
     return chapters
@@ -38,7 +42,9 @@ def parse_json_chapters(data):
 def from_mpv(chapter_list):
     """mpv's chapter-list property -> chapters."""
     chapters = []
-    for entry in chapter_list or []:
+    for entry in (chapter_list if isinstance(chapter_list, list) else [])[:MAX_CHAPTERS]:
+        if not isinstance(entry, dict):
+            continue
         try:
             start = float(entry.get("time", 0) or 0)
         except (TypeError, ValueError):
@@ -56,7 +62,9 @@ def _score(chapters):
 
 
 def merge(first, second):
-    """AntennaPod's ChapterMerger: the longer list wins; equal lists are combined."""
+    """AntennaPod's ChapterMerger: the longer list wins; equal lists are combined. Each at most MAX_CHAPTERS long
+    (a library can come from anywhere)."""
+    first, second = (chapters[:MAX_CHAPTERS] if chapters else chapters for chapters in (first, second))
     if not first:
         return second or first
     if not second:

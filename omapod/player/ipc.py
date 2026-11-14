@@ -16,7 +16,7 @@ from gi.repository import GLib
 
 from .. import APP_NAME, VERSION
 from ..events import bus
-from ..util import fmt_speed
+from ..util import clip, fmt_speed
 
 PROTOCOL = 1
 
@@ -175,16 +175,27 @@ class ControlServer:
         return ""
 
     def snapshot(self):
+        """The player's state for the bar widget and `omapod ctl state`. Only what they show, and nothing longer
+        than a name: the widget runs inside the desktop shell, which reads every line whole. No address goes out,
+        neither the episode's (that of a private feed carries its access token) nor the cover's (the widget gets
+        a thumbnail from omaPOD's cache instead)."""
         state = self.player.state()
         episode = state.get("episode")
         if episode:
-            episode["cover"] = self._cover(episode.get("image") or episode.get("feed_image"))
+            state["episode"] = {
+                "id": episode["id"], "feed_id": episode["feed_id"], "title": clip(episode["title"]),
+                "podcast": clip(episode["podcast"]), "author": clip(episode["author"]),
+                "is_video": episode["is_video"], "downloaded": episode["downloaded"],
+                "pub_date": episode["pub_date"], "favorite": episode["favorite"],
+                "cover": self._cover(episode.get("image") or episode.get("feed_image")),
+            }
+        state["chapter"], state["error"] = clip(state.get("chapter") or ""), clip(state.get("error") or "")
         current = self.player.current_id()
         queue_ids = self.library.queue_ids()
         upcoming = queue_ids[queue_ids.index(current) + 1:] if current in queue_ids else queue_ids
         up_next = []
         for item in self.library.db.get_episodes_by_ids(upcoming[:5]):
-            up_next.append({"id": item.id, "title": item.title, "podcast": item.feed_title,
+            up_next.append({"id": item.id, "title": clip(item.title), "podcast": clip(item.feed_title),
                             "duration": item.duration, "position": item.position,
                             "cover": self._cover(item.cover_url(True))})
         state.update({
@@ -224,7 +235,7 @@ class ControlServer:
         self._last_position_push = now
         self.broadcast({"type": "position", "position": position, "duration": duration,
                         "sent_at": int(time.time() * 1000), "speed": self.player.speed,
-                        "chapter": self.player.state()["chapter"],
+                        "chapter": clip(self.player.state()["chapter"]),
                         "sleep": self.player.state()["sleep"]})
 
     # ------------------------------------------------------------ commands

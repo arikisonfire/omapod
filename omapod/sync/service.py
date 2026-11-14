@@ -30,14 +30,17 @@ from datetime import datetime, timezone
 from ..events import bus
 from ..i18n import _, ngettext
 from ..models import FEED_PREVIEW, FEED_SUBSCRIBED, LOCAL_PREFIX, NEW, PLAYED, UNPLAYED
-from ..util import MAX_SECONDS, now_ms, now_s
-from .providers import GpodderNet, Nextcloud, SyncAuthError, SyncError
+from ..util import (MAX_SECONDS, clip, now_ms, now_s, plain_address, scrub_logins, split_login, sync_address,
+                    sync_feed_address)
+from .providers import GpodderNet, Nextcloud, SyncAuthError, SyncError, https_upgrade
 
 
 # Version of the one-time correction of the history (see SyncService._repair_history).
 HISTORY_REPAIR = 2
 # What a sync can run into without a bug: the server's errors, the network, broken JSON.
 EXPECTED_ERRORS = (SyncError, OSError, ValueError, KeyError)
+# Podcasts a server may add in one run. Far beyond any library; a broken or hostile server could name millions.
+MAX_NEW_SUBSCRIPTIONS = 5000
 
 
 def provider_from_credentials(creds):
@@ -142,11 +145,52 @@ def _seconds(value):
     return number if abs(number) <= MAX_SECONDS else None
 
 
+def sendable(action):
+    """An episode action as it may go to the server, or None: its podcast and episode are plain web addresses
+    (util.sync_address). Also for actions that waited in the queue since an earlier version, which kept
+    addresses as they were typed."""
+    podcast, episode = sync_feed_address(action.get("podcast")), sync_address(action.get("episode"))
+    if not podcast or not episode:
+        return None
+    return dict(action, podcast=podcast, episode=episode)
+
+
 def shared_entry(episode):
-    item = {"podcast": episode.feed_url, "episode": episode.media_url, "title": episode.title}
+    """An episode in the queue or the favorites as omaPOD computers share it, or None when its podcast's or its
+    own address is not one to tell a server (a folder's, or no plain web address)."""
+    podcast, media = sync_feed_address(episode.feed_url), sync_address(episode.media_url)
+    if not podcast or (episode.media_url and not media):
+        return None
+    item = {"podcast": podcast, "episode": media, "title": episode.title}
     if episode.guid:
         item["guid"] = episode.guid
     return item
+
+
+def shared_entries(episodes):
+    return [item for item in map(shared_entry, episodes) if item is not None]
+
+
+def received_entry(item):
+    """An entry as another computer shared it, the way this one keeps addresses: without a login (an omaPOD up
+    to 0.1.4 may have written one). What else it holds stays (a later version may add to it), with no login in
+    any of it either."""
+    entry = scrub_logins(item)
+    entry.update(podcast=plain_address(str(item.get("podcast") or "")),
+                 episode=plain_address(str(item.get("episode") or "")))
+    if "title" in entry:
+        entry["title"] = clip(str(entry["title"]))
+    return entry
+
+
+def received_entries(remote):
+    """(entries, as_sent) from a shared file: its episodes, or None when it has none to read, and whether they
+    were written the way this version writes them. If not, the file is written anew."""
+    shared = remote.get("episodes") if isinstance(remote, dict) else None
+    if not isinstance(shared, list):
+        return None, True
+    entries = [received_entry(item) for item in shared if isinstance(item, dict)]
+    return entries, entries == shared
 
 
 def shared_key(item):
@@ -200,6 +244,7 @@ class SyncService:
         self.running = False
         self._last_pull = 0.0
         self._pull_failed = 0.0
+        self._https_tried = ""
         self._queue_token = bus.subscribe("queue-changed", self._on_queue_changed)
 
     def close(self):
@@ -212,6 +257,32 @@ class SyncService:
 
     def status(self, text):
         bus.emit("sync-state", self.running, text)
+
+    def _prefer_https(self, provider):
+        """A sync server stored with http:// is tried over https, once each time omaPOD runs. If it answers there
+        (with a certificate the system trusts, or the one the user confirmed for it), the login is kept with
+        https from then on, and the password no longer travels in plain text.
+
+        Up to 0.1.1 the address a Nextcloud named for itself was stored after the login, and behind a proxy that
+        ends TLS that is often http://, though the user had typed https://. A server that really has no https
+        fails this try and stays as it is, with the warning in the sync settings."""
+        sync = self.credentials.get("sync")
+        server = str(sync.get("server") or "")
+        candidate = https_upgrade(server)
+        if not candidate or self._https_tried == server:
+            return provider
+        self._https_tried = server
+        upgraded = provider_from_credentials({"sync": {**sync, "server": candidate}})
+        if upgraded is None:
+            return provider
+        upgraded.timeout = 10
+        try:
+            upgraded.get_subscription_changes(int(time.time()))
+        except EXPECTED_ERRORS:
+            return provider
+        self.credentials.set("sync", {**sync, "server": candidate})
+        upgraded.timeout = provider.timeout
+        return upgraded
 
     def run(self, full=False):
         """Synchronize now. Runs in the calling worker thread. Returns True on success."""
@@ -227,6 +298,7 @@ class SyncService:
                 self.settings.set("sync_last_subscriptions", 0)
                 self.settings.set("sync_last_actions", 0)
             self.status(_("Sync started"))
+            provider = self._prefer_https(provider)
             provider.login()
             new_feeds = self._sync_subscriptions(provider)
             if new_feeds:
@@ -299,8 +371,9 @@ class SyncService:
     # -- subscriptions ---------------------------------------------------------
 
     def _local_subscription_urls(self):
-        return [f.url for f in self.db.get_feeds(states=(FEED_SUBSCRIBED,), with_counts=False)
-                if not f.url.startswith(LOCAL_PREFIX)]
+        urls = (sync_feed_address(f.url) for f in self.db.get_feeds(states=(FEED_SUBSCRIBED,), with_counts=False)
+                if not f.url.startswith(LOCAL_PREFIX))
+        return list(dict.fromkeys(url for url in urls if url))
 
     def _sync_subscriptions(self, provider):
         last = int(self.settings.get("sync_last_subscriptions") or 0)
@@ -310,14 +383,27 @@ class SyncService:
         changes = provider.get_subscription_changes(last)
         new_timestamp = changes.timestamp
         pending = self.db.sync_pending("sub")
-        queued_added = [p["url"] for _id, p in pending if p.get("action") == "add"]
-        queued_removed = [p["url"] for _id, p in pending if p.get("action") == "remove"]
+        # What waits in the queue is checked like everything that goes to the server (util.sync_address).
+        queued_added = [u for u in (sync_feed_address(p.get("url")) for _id, p in pending if p.get("action") == "add")
+                        if u]
+        queued_removed = [u for u in (sync_feed_address(p.get("url")) for _id, p in pending
+                                      if p.get("action") == "remove") if u]
+        # Another app may name a podcast with its login in the address (AntennaPod keeps an address as it was
+        # typed). Here the login becomes the podcast's own and the address goes without it, and both forms are
+        # the same podcast. omaPOD itself never sends the form with the login, not even back to this server.
+        # Only plain web addresses are taken at all: no folder (local:…) is added or removed by a server.
+        server_added, server_removed = set(), {sync_feed_address(named) for named in changes.removed} - {""}
         new_feeds = []
-        for url in changes.added:
-            if not url.startswith("http"):
+        for named in changes.added[:MAX_NEW_SUBSCRIPTIONS]:
+            address, user, secret = split_login(named)
+            url = sync_feed_address(address)
+            if not url:
                 continue
+            server_added.add(url)
             if url in local_set or url in queued_removed:
                 continue
+            if named != url and url in server_removed:
+                continue  # unsubscribed under its plain address, by this computer or another omaPOD
             existing = self.db.get_feed_by_url(url)
             if existing is not None:
                 if existing.state == FEED_PREVIEW:  # an archived one stays archived: that is local
@@ -325,11 +411,13 @@ class SyncService:
                     new_feeds.append(existing.id)
                 continue
             with self.db.tx() as conn:
-                feed_id = self.db.insert_feed(conn, {"url": url, "title": _("Unknown podcast"),
-                                                     "state": FEED_SUBSCRIBED, "added": now_s()})
+                feed_id = self.db.insert_feed(conn, {"url": url, "username": user, "password": secret,
+                                                     "title": _("Unknown podcast"), "state": FEED_SUBSCRIBED,
+                                                     "added": now_s()})
             new_feeds.append(feed_id)
+            local_set.add(url)
         removed_ids = []
-        for url in changes.removed:
+        for url in sorted(server_removed):
             if url in queued_added:
                 continue
             feed = self.db.get_feed_by_url(url)
@@ -340,8 +428,8 @@ class SyncService:
             self.library.unsubscribe(removed_ids, sync=False)
         if last == 0:
             queued_added = list(dict.fromkeys(queued_added + local))
-        queued_added = [u for u in queued_added if u not in changes.added]
-        queued_removed = [u for u in queued_removed if u not in changes.removed]
+        queued_added = [u for u in queued_added if u not in server_added]
+        queued_removed = [u for u in queued_removed if u not in server_removed]
         if queued_added or queued_removed:
             new_timestamp = provider.upload_subscription_changes(queued_added, queued_removed)
         self.db.sync_remove([row_id for row_id, _p in pending])
@@ -388,8 +476,10 @@ class SyncService:
                 if episode.feed_url.startswith(LOCAL_PREFIX):
                     continue
                 seconds = episode.duration // 1000
-                action = {"podcast": episode.feed_url, "episode": episode.media_url, "action": "play",
-                          "timestamp": stamp, "started": seconds, "position": seconds, "total": seconds}
+                action = sendable({"podcast": episode.feed_url, "episode": episode.media_url, "action": "play",
+                                   "timestamp": stamp, "started": seconds, "position": seconds, "total": seconds})
+                if action is None:
+                    continue
                 if episode.guid:
                     action["guid"] = episode.guid
                 played.append(action)
@@ -405,7 +495,8 @@ class SyncService:
         seen = self.db.sync_seen(k for _id, payload in pending for k in seen_keys(payload))
         stale = [row_id for row_id, payload in pending if str(payload.get("action", "")).lower() == "play"
                  and epoch(payload.get("timestamp")) < max((seen.get(k, 0) for k in seen_keys(payload)), default=0)]
-        queued = [payload for row_id, payload in pending if row_id not in stale] + list(extra)
+        queued = [action for action in (sendable(payload) for row_id, payload in pending if row_id not in stale)
+                  if action is not None] + list(extra)
         timestamp = None
         if queued:
             timestamp = provider.upload_episode_actions(queued)
@@ -632,7 +723,7 @@ class SyncService:
     # -- queue and favorites, shared between omaPOD computers -------------------
 
     def _queue_entries(self):
-        return [shared_entry(e) for e in self.db.get_queue() if not e.is_local]
+        return shared_entries(self.db.get_queue())
 
     def _on_queue_changed(self):
         if not self.settings.get("sync_queue_favorites") or not self.settings.get("sync_provider"):
@@ -667,8 +758,7 @@ class SyncService:
         """The queue has an order, so the newer change wins as a whole. Joining keeps both queues."""
         local = self._queue_entries()
         remote, etag = provider.get_shared("queue.json")
-        shared = remote.get("episodes") if isinstance(remote, dict) else None
-        shared = [i for i in shared if isinstance(i, dict)] if isinstance(shared, list) else None
+        shared, as_sent = received_entries(remote)
         modified, incoming = now_ms(), False
         if shared is None:
             result = local
@@ -687,7 +777,7 @@ class SyncService:
             ids = self._resolve(result, refresh=incoming)
             if ids != self.db.queue_ids():
                 self.library.replace_queue(ids)
-        if shared is None or shared_hash(result) != shared_hash(shared):
+        if shared is None or not as_sent or shared_hash(result) != shared_hash(shared):
             data = {"version": 1, "modified": modified, "device": default_device_id(), "episodes": result}
             if provider.put_shared("queue.json", data, etag) is None:
                 return  # another computer wrote in between; the next run settles it
@@ -696,28 +786,37 @@ class SyncService:
 
     def _sync_favorites(self, provider):
         """Favorites are a set: what either side added or removed since the last sync wins, nothing is lost."""
-        local_items = {shared_key(i): i for i in map(shared_entry, self.db.get_episodes(("favorite",)))
-                       if not i["podcast"].startswith(LOCAL_PREFIX)}
+        def favorites():
+            """{episode id: shared entry} of the favorites that can be shared."""
+            entries = ((episode.id, shared_entry(episode)) for episode in self.db.get_episodes(("favorite",)))
+            return {episode_id: entry for episode_id, entry in entries if entry is not None}
+
+        def remembered(name):
+            # What the last sync saw, with addresses as they are kept now (an earlier version kept logins in them).
+            keys = self.settings.get(name)
+            return {tuple(plain_address(str(part)) for part in key) for key in keys
+                    if isinstance(key, (list, tuple)) and len(key) == 2} if isinstance(keys, list) else set()
+
+        local_items = {shared_key(entry): entry for entry in favorites().values()}
         remote, etag = provider.get_shared("favorites.json")
-        shared = remote.get("episodes") if isinstance(remote, dict) else None
-        shared_items = {shared_key(i): i for i in shared if isinstance(i, dict)} if isinstance(shared, list) else None
-        before = {tuple(k) for k in self.settings.get("favorites_sync_base") or []}
-        local_before = {tuple(k) for k in self.settings.get("favorites_sync_local") or []}
+        shared, as_sent = received_entries(remote)
+        shared_items = {shared_key(i): i for i in shared} if shared is not None else None
+        before, local_before = remembered("favorites_sync_base"), remembered("favorites_sync_local")
         current = set(shared_items) if shared_items is not None else before
         added, removed = set(local_items) - local_before, local_before - set(local_items)
         result = (current | added) - removed
         items = {**local_items, **(shared_items or {})}
         result_items = [items[k] if k in items else {"podcast": k[0], "episode": k[1]} for k in sorted(result)]
         wanted = set(self._resolve(result_items, refresh=bool(current - before)))
-        have = {e.id for e in self.db.get_episodes(("favorite",)) if not e.is_local}
+        have = set(favorites())  # only what can be shared: another favorite is not one the others took back
         if wanted - have:
             self.library.set_favorite(sorted(wanted - have), True, sync=False)
         if have - wanted:
             self.library.set_favorite(sorted(have - wanted), False, sync=False)
-        if shared_items is None or result != set(shared_items):
+        if shared_items is None or not as_sent or result != set(shared_items):
             data = {"version": 1, "modified": now_ms(), "device": default_device_id(), "episodes": result_items}
             if provider.put_shared("favorites.json", data, etag) is None:
                 return
-        now_local = [list(shared_key(shared_entry(e))) for e in self.db.get_episodes(("favorite",)) if not e.is_local]
+        now_local = [list(shared_key(entry)) for entry in favorites().values()]
         self.settings.update({"favorites_sync_base": [list(k) for k in sorted(result)],
                               "favorites_sync_local": sorted(now_local)})

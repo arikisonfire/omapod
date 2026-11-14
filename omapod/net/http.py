@@ -8,22 +8,29 @@ download log).
 """
 
 import base64
-import functools
 import hashlib
 import http.client
+import os
 import socket
 import ssl
+import threading
 import urllib.error
 import urllib.request
 import zlib
 from dataclasses import dataclass, field
-from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from .. import USER_AGENT
 from ..i18n import _
+from ..util import split_login
 
 TIMEOUT = 30
 PROXY_AUTH = "Proxy-authorization"  # as urllib's ProxyHandler names the header (Request capitalizes header names)
+# What a request may take along when a redirect leads to another server. urllib copies every header of the
+# request to wherever a redirect points; a header a caller added for one server (an API key, say) is not for the
+# next one. Credentials have their own rule (auth_allowed).
+HEADERS_FOR_ANY_SERVER = frozenset({"accept", "accept-encoding", "accept-language", "user-agent", "range",
+                                    "if-none-match", "if-modified-since"})
 
 
 class HttpError(Exception):
@@ -82,12 +89,14 @@ class Response:
 
 
 def _origin(url):
-    parts = urlsplit(url)
-    scheme = parts.scheme.lower()
+    """(scheme, host, port) of an address; the host is "" for an address that has none or whose port is not a
+    number, and such an address is no origin of anything (auth_allowed)."""
     try:
-        port = parts.port
+        parts = urlsplit(url)
+        scheme, port = parts.scheme.lower(), parts.port
     except ValueError:
-        port = None
+        # Not read as "the default port": another program (ffmpeg, for streams) may read a port out of it.
+        return "", "", None
     return scheme, (parts.hostname or "").lower(), port or {"http": 80, "https": 443}.get(scheme)
 
 
@@ -115,15 +124,20 @@ class _RedirectRecorder(urllib.request.HTTPRedirectHandler):
     credentials along only where auth_allowed lets them."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        # A login a server writes into the address it redirects to is not used (and urllib would look the whole
+        # of "user:password@host" up as a host name).
+        new = super().redirect_request(req, fp, code, msg, headers, split_login(newurl)[0])
         if new is not None:
             # urllib copies the proxy login too, and a host the proxy is bypassed for (no_proxy) would receive it.
             # ProxyHandler adds it again to every request that goes through the proxy.
             new.remove_header(PROXY_AUTH)
+            if not auth_allowed(req.full_url, new.full_url):
+                for name in [name for name in new.headers if name.lower() not in HEADERS_FOR_ANY_SERVER]:
+                    new.remove_header(name)
             chain = getattr(req, "redirect_chain", None)
             if chain is None:
                 chain = []
-            chain.append((code, newurl))
+            chain.append((code, new.full_url))  # without a login written into it (see above)
             new.redirect_chain = chain
             # Credentials are unredirected headers, which urllib leaves behind (it copies every other header,
             # even from https to http), so they are added again only where they belong.
@@ -185,24 +199,112 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 
 
 class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
-    def __init__(self, cert_sha256):
+    def __init__(self, cert_sha256, deadline=None):
         super().__init__()
         self._cert_sha256 = cert_sha256
+        self._deadline = deadline
 
     def https_open(self, req):
-        return self.do_open(functools.partial(_PinnedHTTPSConnection, cert_sha256=self._cert_sha256), req)
+        return self.do_open(_watched(_PinnedHTTPSConnection, self._deadline, cert_sha256=self._cert_sha256), req)
 
 
-def build_opener(cert_sha256=""):
+class Deadline:
+    """The time a whole request may take. The timeout of a connection only limits each wait for the next bytes: a
+    server that sends one byte every few seconds would keep a request, and with it the refresh of all podcasts,
+    going for days. When the time is up, the connections of the request are shut down, whatever they are waiting
+    for (the TLS handshake, the headers, the body); the pending read then fails. close() ends the watch."""
+
+    def __init__(self, seconds):
+        self.expired = False
+        self._lock = threading.Lock()
+        self._sockets = []  # duplicates of the request's sockets; shutting one down ends the connection itself
+        self._timer = threading.Timer(seconds, self._expire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def watch(self, sock):
+        duplicate = socket.socket(fileno=os.dup(sock.fileno()))
+        with self._lock:
+            self._sockets.append(duplicate)
+            expired = self.expired
+        if expired:
+            self._shut(duplicate)
+
+    @staticmethod
+    def _shut(sock):
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _expire(self):
+        with self._lock:
+            self.expired = True
+            for sock in self._sockets:
+                self._shut(sock)
+
+    def close(self):
+        self._timer.cancel()
+        with self._lock:
+            sockets, self._sockets = self._sockets, []
+        for sock in sockets:
+            sock.close()
+
+
+def total_time(timeout):
+    """How long a whole request may take when each wait for the server may take `timeout` seconds: long enough
+    for a large feed over a slow line (five minutes at the usual 30 s), short next to a server that never
+    finishes."""
+    return max(10 * timeout, 30)
+
+
+def _watched(connection_class, deadline, **fixed):
+    """connection_class whose socket the deadline watches from the moment it is connected."""
+
+    def connect(host, **kwargs):
+        connection = connection_class(host, **fixed, **kwargs)
+        create = getattr(connection, "_create_connection", None)
+        if deadline is not None and create is not None:
+            def create_watched(*args, **kwargs):
+                sock = create(*args, **kwargs)
+                deadline.watch(sock)
+                return sock
+
+            connection._create_connection = create_watched
+        return connection
+
+    return connect
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, deadline=None):
+        super().__init__()
+        self._deadline = deadline
+
+    def http_open(self, req):
+        return self.do_open(_watched(http.client.HTTPConnection, self._deadline), req)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, deadline=None):
+        self._tls = ssl.create_default_context()
+        super().__init__(context=self._tls)
+        self._deadline = deadline
+
+    def https_open(self, req):
+        return self.do_open(_watched(http.client.HTTPSConnection, self._deadline), req, context=self._tls)
+
+
+def build_opener(cert_sha256="", deadline=None):
     """An opener for http and https only. Addresses come from feeds, and urllib's default openers would
-    read file:, ftp: and data: ones as well."""
+    read file:, ftp: and data: ones as well. With a deadline, its connections end when the time is up."""
     if cert_sha256:
-        https = _PinnedHTTPSHandler(cert_sha256)
+        https = _PinnedHTTPSHandler(cert_sha256, deadline)
     else:
-        https = urllib.request.HTTPSHandler(context=ssl.create_default_context())
+        https = _HTTPSHandler(deadline)
     opener = urllib.request.OpenerDirector()
     for handler in (_proxy_handler() or urllib.request.ProxyHandler(), urllib.request.UnknownHandler(),
-                    urllib.request.HTTPHandler(), https, urllib.request.HTTPDefaultErrorHandler(),
+                    _HTTPHandler(deadline), https, urllib.request.HTTPDefaultErrorHandler(),
                     _RedirectRecorder(), urllib.request.HTTPErrorProcessor()):
         opener.add_handler(handler)
     return opener
@@ -278,14 +380,13 @@ def basic_auth(username, password):
 
 
 def split_userinfo(url):
-    """https://user:pass@host/feed -> (https://host/feed, user, pass). The host keeps its port and, for an IPv6
-    address, its brackets."""
-    parts = urlsplit(url)
-    if not parts.username:
-        return url, "", ""
-    netloc = parts.netloc.rpartition("@")[2]
-    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment)), \
-        unquote(parts.username or ""), unquote(parts.password or "")
+    """https://user:pass@host/feed -> (https://host/feed, user, pass), see util.split_login."""
+    return split_login(url)
+
+
+def has_login(auth):
+    """Whether (username, password) is a login to send: a name, or a password without one (an access token)."""
+    return bool(auth) and bool(auth[0] or auth[1])
 
 
 def describe_error(error, url=""):
@@ -360,11 +461,11 @@ def _prepare(url, method, headers, data, auth, auth_url):
     """A request whose credentials (auth, user:password in the address or an Authorization header) go only to
     the address they belong to: auth_url, by default the address itself (see auth_allowed)."""
     url, user, password = split_userinfo(url)
-    if auth is None and user:
+    if not has_login(auth) and (user or password):
         auth, auth_url = (user, password), url
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("User-Agent", USER_AGENT)
-    req.authorization = basic_auth(auth[0], auth[1]) if auth and auth[0] else ""
+    req.authorization = basic_auth(auth[0], auth[1]) if has_login(auth) else ""
     for key, value in (headers or {}).items():
         if key.lower() == "authorization":
             req.authorization = value
@@ -379,18 +480,25 @@ def _prepare(url, method, headers, data, auth, auth_url):
 
 def open_url(url, method="GET", headers=None, data=None, auth=None, timeout=TIMEOUT, auth_url=""):
     """Open a streaming response. The caller must close it. Returns (response, redirect_chain).
-    Credentials work as in request(); an HTTPError's geturl() is the address that answered."""
+    Credentials work as in request(); an HTTPError's geturl() is the address that answered. Getting to the
+    answer's headers, through every redirect, has a time limit as a whole (Deadline); how long the body may take
+    is up to the caller, who reads it."""
     req = _prepare(url, method, {"Accept-Encoding": "identity", **(headers or {})}, data, auth, auth_url)
-    response = build_opener().open(req, timeout=timeout)
+    deadline = Deadline(total_time(timeout))
+    try:
+        response = build_opener(deadline=deadline).open(req, timeout=timeout)
+    finally:
+        deadline.close()
     return response, req.redirect_chain
 
 
 def request(url, method="GET", headers=None, data=None, auth=None, timeout=TIMEOUT, etag="", last_modified="",
-            max_bytes=64 * 1024 * 1024, cert_sha256="", auth_url=""):
+            max_bytes=64 * 1024 * 1024, cert_sha256="", auth_url="", total=None):
     """Fetch a whole resource into memory. Raises NotModified for 304, HttpError otherwise.
     With cert_sha256, HTTPS accepts only that certificate (one the user trusted explicitly).
     Credentials go only to the origin of auth_url (by default url), also along redirects, and never to
-    another host, even one that asks for them; HttpError.final_url names the address that answered."""
+    another host, even one that asks for them; HttpError.final_url names the address that answered.
+    timeout limits each wait for the server, total (by default total_time(timeout)) the whole request."""
     defaults = {"Accept-Encoding": "gzip, deflate"}
     if etag:
         defaults["If-None-Match"] = etag
@@ -398,9 +506,24 @@ def request(url, method="GET", headers=None, data=None, auth=None, timeout=TIMEO
         defaults["If-Modified-Since"] = last_modified
     req = _prepare(url, method, {**defaults, **(headers or {})}, data, auth, auth_url)
     url = req.full_url
+    deadline = Deadline(total or total_time(timeout))
     try:
-        with build_opener(cert_sha256).open(req, timeout=timeout) as handle:
+        return _request(req, url, timeout, max_bytes, cert_sha256, deadline)
+    except HttpError as error:
+        if deadline.expired and not error.status:
+            raise HttpError(_("Connection error"), detail=_("The server took too long to answer."), url=url) from None
+        raise
+    finally:
+        deadline.close()
+
+
+def _request(req, url, timeout, max_bytes, cert_sha256, deadline):
+    try:
+        with build_opener(cert_sha256, deadline).open(req, timeout=timeout) as handle:
             body = handle.read(max_bytes + 1)
+            if deadline.expired:
+                # A body without a stated length ends where the connection ends: cut off, it would pass for whole.
+                raise TimeoutError()
             if len(body) > max_bytes:
                 raise HttpError(_("The response is too large."), url=url)
             headers_out = {k.lower(): v for k, v in handle.headers.items()}

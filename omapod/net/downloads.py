@@ -37,6 +37,10 @@ KNOWN_EXT = set(MIME_EXT.values()) | {".m4b", ".oga", ".mka", ".m4v"}
 UNKNOWN_SIZE_LIMIT = 2 * 1024 * 1024 * 1024
 FREE_SPACE_RESERVE = 50 * 1024 * 1024  # what a download leaves free on the disk
 SPACE_CHECK_EVERY = 32 * 1024 * 1024
+# A download that gets less than this in a minute is given up: a server that sends a few bytes now and then would
+# otherwise keep one of the few download workers for days. What arrived stays, and the download can go on later.
+SLOW_SECONDS = 60
+SLOW_BYTES = 64 * 1024
 
 
 @dataclass
@@ -215,7 +219,7 @@ class DownloadManager:
             headers["Range"] = f"bytes={offset}-"
         # The podcast's password goes only to its own server, also at the end of a redirect (statistics prefixes).
         # Media hosts elsewhere (CDNs, statistics services) never get it, not even when they ask for it.
-        auth = (feed.username, feed.password) if feed.username else None
+        auth = feed.login
         try:
             response, _chain = http.open_url(episode.media_url, headers=headers, auth=auth, auth_url=feed.url,
                                              timeout=30)
@@ -257,11 +261,14 @@ class DownloadManager:
             checked = offset
             handle.truncate(offset)  # what is there continues (offset is its size), or it starts again at 0
             handle.seek(offset)
+            slow_since, slow_from = time.monotonic(), offset
             while True:
                 if job.cancelled:
                     break
                 try:
-                    chunk = response.read(256 * 1024)
+                    # read1: what has arrived, not a full buffer. A slow server is noticed, and cancelling works,
+                    # within one wait for the network.
+                    chunk = response.read1(256 * 1024)
                 except (OSError, http.HttpError) as error:
                     reason, detail = http.describe_error(error, episode.media_url)
                     handle.flush()
@@ -276,6 +283,14 @@ class DownloadManager:
                     break
                 handle.write(chunk)
                 job.received += len(chunk)
+                if time.monotonic() - slow_since >= SLOW_SECONDS:
+                    if job.received - slow_from < SLOW_BYTES:
+                        handle.flush()
+                        self.library.download_failed(
+                            episode.id, _("The server connection was lost before completing the download"),
+                            f"less than {SLOW_BYTES} bytes in {SLOW_SECONDS} s", job.manual)
+                        return
+                    slow_since, slow_from = time.monotonic(), job.received
                 if job.received - checked >= SPACE_CHECK_EVERY:
                     checked = job.received
                     free = shutil.disk_usage(folder_fd).free
